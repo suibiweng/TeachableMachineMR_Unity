@@ -2,105 +2,77 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using UnityEngine;
-using Unity.InferenceEngine;   // ModelAsset (embedder switching)
+using Unity.InferenceEngine; // for ModelAsset (Sentis)
 
+[DisallowMultipleComponent]
 public class DynamicClassTrainer : MonoBehaviour
 {
     [Header("Pipeline")]
     public SentisEmbedder embedder;         // assign in Inspector
-    public Texture sourceTexture;           // RT_224 or Passthrough RT
+    public Texture sourceTexture;           // 224x224 RenderTexture (webcam/passthrough)
     public LiveClassifier liveClassifier;   // optional: apply trained head live
 
-    [Header("Models (optional switching)")]
-    public List<ModelAsset> availableModels = new List<ModelAsset>(); // drag ModelAssets here if you want to switch
-    public int currentModelIndex = 0;                                 // selected index in availableModels
-    public string resourcesModelName = "";                            // optional: Resources path for ModelAsset
+    [Header("Models (Sentis)")]
+    public List<ModelAsset> availableModels = new List<ModelAsset>();
+    public int currentModelIndex = 0;
 
-    [Header("Classes & Session")]
-    public List<string> classNames = new List<string> { "class_A", "class_B" };
+    [Header("Session & Files")]
     public string sessionName = "session1";
     public string saveHeadName = "head_runtime.json";
     public string loadHeadName = "head_runtime.json";
 
-    [Header("Options")]
-    public bool rememberHeadAsDefault = true; // remember last trained head name (auto-load next run)
-
-    // Runtime state
+    [Header("Classes")]
+    [SerializeField] private List<string> classNames = new List<string> { "class_A", "class_B" };
     private int currentClass = 0;
-    private int embeddingDim = -1;
-    private List<float[]> sums = new List<float[]>();  // cumulative (normalized) embeddings per class
-    private List<int> counts = new List<int>();        // sample counts per class
 
-    // Events
+    // Running sums of normalized embeddings, and counts, per class
+    private List<float[]> sums = new List<float[]>();
+    private List<int> counts = new List<int>();
+
+    // Embedding dimension (set once we get the first embedding)
+    private int embeddingDim = -1;
+
+    // 🔔 Event: many of your scripts subscribe to this exact signature
     public event Action<string, HeadData> OnHeadTrained;
 
-    // Public info
-    public int CurrentClassIndex => currentClass;
+    // Properties used by TrainerUIController and others
     public IReadOnlyList<string> Classes => classNames;
+    public int CurrentClassIndex => currentClass;
     public int EmbeddingDim => embeddingDim;
     public string PersistentPath => Application.persistentDataPath;
-    public string CurrentModelName => embedder ? embedder.CurrentModelName : "(no model)";
 
     void Awake()
     {
         EnsureAccumulatorsSized();
-
-        // If embedder has no model but we have one in the list, load it
+        // Optional: auto-select model if provided
         if (embedder && embedder.modelAsset == null && availableModels.Count > 0)
-        {
             SelectModelByIndex(Mathf.Clamp(currentModelIndex, 0, availableModels.Count - 1));
-        }
-        else if (embedder && embedder.modelAsset != null)
-        {
-            Debug.Log($"[Trainer] Using existing model: {embedder.CurrentModelName}");
-        }
     }
 
-    // --------------------------- MODEL SWITCHING ----------------------------
-
+    // ---------------- Model switching (optional) ----------------
     public void SelectModelByIndex(int index)
     {
         if (embedder == null || availableModels == null || availableModels.Count == 0) return;
         index = Mathf.Clamp(index, 0, availableModels.Count - 1);
         currentModelIndex = index;
-        var asset = availableModels[index];
-        embedder.LoadModel(asset); // re-create worker with same IO names/size set on embedder
-        OnModelSwitched();
-    }
-
-    public void SelectModelByNameFromResources(string modelPath, string inName = null, string outName = null, int? size = null, bool? nhwc = null)
-    {
-        if (embedder == null || string.IsNullOrWhiteSpace(modelPath)) return;
-        var asset = Resources.Load<ModelAsset>(modelPath); // e.g. "Models/mobilenetv3_small_embed"
-        if (asset == null) { Debug.LogError($"[Trainer] Resources model '{modelPath}' not found."); return; }
-        resourcesModelName = modelPath;
-        embedder.LoadModel(asset, inName, outName, size, nhwc);
-        OnModelSwitched();
-    }
-
-    void OnModelSwitched()
-    {
-        Debug.Log($"[Trainer] Model switched -> {CurrentModelName}");
-        // Embedding dim may change; clear accumulators and start clean
+        embedder.LoadModel(availableModels[index]); // your SentisEmbedder should handle this
+        // Clear accumulators (old samples incompatible with new model dims)
         embeddingDim = -1;
-        for (int i = 0; i < sums.Count; i++) sums[i] = null;
-        for (int i = 0; i < counts.Count; i++) counts[i] = 0;
-        // You’ll need to re-collect samples and retrain a head for the new embedder.
+        sums.Clear(); counts.Clear();
+        EnsureAccumulatorsSized();
+        Debug.Log($"[Trainer] Model switched -> {availableModels[index].name}");
     }
 
-    // --------------------------- CLASS & TRAINING ---------------------------
-
+    // ---------------- Class management ----------------
     public void AddClass(string name)
     {
-        name = Sanitize(name);
-        if (string.IsNullOrWhiteSpace(name)) return;
-
+        name = (name ?? "").Trim();
+        if (string.IsNullOrEmpty(name)) return;
         classNames.Add(name);
         sums.Add(embeddingDim > 0 ? new float[embeddingDim] : null);
         counts.Add(0);
-
         currentClass = classNames.Count - 1;
-        Debug.Log($"[Trainer] Added class '{name}' (total={classNames.Count})");
+        Debug.Log($"[Trainer] Added class '{name}'");
     }
 
     public void SelectClass(int index)
@@ -109,33 +81,64 @@ public class DynamicClassTrainer : MonoBehaviour
         currentClass = index;
     }
 
+    // ✅ Overload expected by HeadAutoLoader / HeadSwitcherDropdown (string[])
+    public void ResetAll(string[] newClasses)
+    {
+        ResetAll(newClasses == null ? new List<string>() : new List<string>(newClasses));
+    }
+
+    // ✅ Overload used elsewhere (List<string>)
+    public void ResetAll(List<string> newClasses)
+    {
+        classNames = newClasses ?? new List<string>();
+        currentClass = classNames.Count > 0 ? 0 : -1;
+
+        sums.Clear(); counts.Clear();
+        for (int i = 0; i < classNames.Count; i++)
+        {
+            sums.Add(embeddingDim > 0 ? new float[embeddingDim] : null);
+            counts.Add(0);
+        }
+        Debug.Log($"[Trainer] ResetAll -> {classNames.Count} classes");
+    }
+
+    // ---------------- Data collection ----------------
     public void AddSampleFromCurrent()
     {
+        if (currentClass < 0 || currentClass >= classNames.Count)
+        {
+            Debug.LogWarning("[Trainer] No class selected.");
+            return;
+        }
         var z = GetEmbedding();
-        if (z == null) { Debug.LogWarning("[Trainer] No embedding."); return; }
+        if (z == null) return;
 
-        // Accumulate normalized embedding
         var zn = (float[])z.Clone();
         TinyHeads.L2Normalize(zn);
 
-        var arr = sums[currentClass];
-        if (arr == null || arr.Length != embeddingDim)
+        var acc = sums[currentClass];
+        if (acc == null || acc.Length != embeddingDim)
         {
-            arr = new float[embeddingDim];
-            sums[currentClass] = arr;
+            acc = new float[embeddingDim];
+            sums[currentClass] = acc;
         }
-        for (int i = 0; i < embeddingDim; i++) arr[i] += zn[i];
+        for (int i = 0; i < embeddingDim; i++) acc[i] += zn[i];
         counts[currentClass]++;
 
         AppendEmbeddingCSV(z, currentClass, sessionName);
-        Debug.Log($"[Trainer] +1 -> '{classNames[currentClass]}' (count={counts[currentClass]})");
+        Debug.Log($"[Trainer] +1 to '{classNames[currentClass]}' (count={counts[currentClass]})");
     }
 
+    // ---------------- Train / Save / Apply ----------------
     public void TrainAndSaveAndApply()
     {
-        if (embeddingDim <= 0) { Debug.LogWarning("[Trainer] Need samples first."); return; }
-        EnsureAccumulatorsSized();
+        if (embeddingDim <= 0)
+        {
+            Debug.LogWarning("[Trainer] No embeddings yet. Add samples first.");
+            return;
+        }
 
+        EnsureAccumulatorsSized();
         int C = classNames.Count;
         var head = new HeadData { type = "centroid", classes = classNames.ToArray(), centroids = new float[C][] };
 
@@ -149,117 +152,56 @@ public class DynamicClassTrainer : MonoBehaviour
             }
         }
 
-        SaveHead(head, saveHeadName);
+        // Save JSON under .../heads/
+        var dir = Path.Combine(PersistentPath, "heads");
+        Directory.CreateDirectory(dir);
+        var full = Path.Combine(dir, saveHeadName);
+        File.WriteAllText(full, JsonUtility.ToJson(head, true));
+        Debug.Log($"[Trainer] Head saved -> {full}");
 
+        // Apply to Live
         if (liveClassifier) liveClassifier.SetHead(head);
 
-        if (rememberHeadAsDefault)
-        {
-            PlayerPrefs.SetString("TinyTeach_LastHead", saveHeadName);
-            PlayerPrefs.Save();
-        }
+        // Notify listeners (filename + head)
         OnHeadTrained?.Invoke(saveHeadName, head);
-
-        Debug.Log($"[Trainer] Head saved & applied: {Path.Combine(PersistentPath, "heads", saveHeadName)}");
     }
 
     public void LoadHeadAndApply()
     {
-        var path = Path.Combine(PersistentPath, "heads", loadHeadName);
-        if (!File.Exists(path)) { Debug.LogError("[Trainer] Missing head: " + path); return; }
-        var json = File.ReadAllText(path);
+        var full = Path.Combine(PersistentPath, "heads", loadHeadName);
+        if (!File.Exists(full)) { Debug.LogError("[Trainer] Head not found: " + full); return; }
+        var json = File.ReadAllText(full);
         var head = JsonUtility.FromJson<HeadData>(json);
-        classNames = new List<string>(head.classes ?? Array.Empty<string>());
+
+        // Sync classes and zero accumulators
+        ResetAll(head.classes);
 
         if (liveClassifier) liveClassifier.SetHead(head);
-        Debug.Log("[Trainer] Loaded head & applied: " + path);
+
+        // Notify listeners so dropdowns/autoloaders update
+        OnHeadTrained?.Invoke(loadHeadName, head);
+
+        Debug.Log($"[Trainer] Head loaded & applied -> {full}");
     }
 
-    // --------------------------- CLEAN-UP / SESSION ------------------------
-
-    public void SetSessionName(string newSession) {
-        if (!string.IsNullOrWhiteSpace(newSession)) sessionName = newSession.Trim();
-        Debug.Log("[Trainer] Session set to: " + sessionName);
-    }
-
-    public void ClearCurrentClass() {
-        if (embeddingDim <= 0 || currentClass < 0 || currentClass >= classNames.Count) return;
-        sums[currentClass] = new float[embeddingDim];
-        counts[currentClass] = 0;
-        Debug.Log($"[Trainer] Cleared class '{classNames[currentClass]}' samples.");
-    }
-
-    public void RemoveCurrentClass() {
-        if (currentClass < 0 || currentClass >= classNames.Count) return;
-        string removed = classNames[currentClass];
-        classNames.RemoveAt(currentClass);
-        if (currentClass < sums.Count)  sums.RemoveAt(currentClass);
-        if (currentClass < counts.Count) counts.RemoveAt(currentClass);
-        currentClass = Mathf.Clamp(currentClass, 0, classNames.Count - 1);
-        Debug.Log($"[Trainer] Removed class '{removed}'.");
-    }
-
-    public void ResetAll(string[] newClasses = null) {
-        classNames = newClasses != null ? new List<string>(newClasses) : new List<string>();
-        sums.Clear(); counts.Clear();
-        embeddingDim = -1;  // re-init on next sample
-        EnsureAccumulatorsSized();
-        if (liveClassifier) liveClassifier.SetHead(null); // pause until retrained/loaded
-        Debug.Log("[Trainer] Reset all. Define classes and start sampling.");
-    }
-
-    // optional: wipe current session CSV from disk
-    public void DeleteCurrentSessionCSV() {
-        var path = Path.Combine(PersistentPath, "records", sessionName + ".csv");
-        if (File.Exists(path)) { File.Delete(path); Debug.Log("[Trainer] Deleted " + path); }
-    }
-
-    // --------------------------- SNAPSHOT (restored) -----------------------
-
-    public void SaveSnapshotPNG(string prefix = "cap")
-    {
-        var tex = Capture(sourceTexture);
-        if (tex == null) return;
-
-        var bytes = tex.EncodeToPNG();
-        Destroy(tex);
-
-        var dir = Path.Combine(PersistentPath, "records");
-        Directory.CreateDirectory(dir);
-        var file = Path.Combine(dir, $"{prefix}_{classNames[Mathf.Clamp(currentClass,0,Mathf.Max(0,classNames.Count-1))]}_{DateTime.Now:yyyyMMdd_HHmmss}.png");
-        File.WriteAllBytes(file, bytes);
-        Debug.Log("[Trainer] PNG -> " + file);
-    }
-
-    Texture2D Capture(Texture src)
-    {
-        var rt = src as RenderTexture;
-        if (rt == null) { Debug.LogError("[Trainer] sourceTexture must be a RenderTexture"); return null; }
-        var prev = RenderTexture.active;
-        RenderTexture.active = rt;
-        var tex = new Texture2D(rt.width, rt.height, TextureFormat.RGB24, false);
-        tex.ReadPixels(new Rect(0, 0, rt.width, rt.height), 0, 0);
-        tex.Apply();
-        RenderTexture.active = prev;
-        return tex;
-    }
-
-    // --------------------------- INTERNALS ---------------------------------
-
-    string Sanitize(string s) => s?.Trim();
-
+    // ---------------- Utility ----------------
     float[] GetEmbedding()
     {
-        if (embedder == null || sourceTexture == null) return null;
+        if (embedder == null || sourceTexture == null)
+        {
+            Debug.LogError("[Trainer] Missing embedder or sourceTexture");
+            return null;
+        }
         var z = embedder.Embed(sourceTexture);
-        if (z == null) return null;
+        if (z == null) { Debug.LogError("[Trainer] Embed returned null"); return null; }
 
         if (embeddingDim < 0)
         {
             embeddingDim = z.Length;
-            // resize accumulators to new D
+            // resize accumulators
             for (int i = 0; i < sums.Count; i++) sums[i] = new float[embeddingDim];
             for (int i = 0; i < counts.Count; i++) counts[i] = 0;
+            Debug.Log($"[Trainer] Set embeddingDim={embeddingDim}");
         }
         return z;
     }
@@ -285,12 +227,60 @@ public class DynamicClassTrainer : MonoBehaviour
         }
     }
 
-    void SaveHead(HeadData head, string filename)
+    public void SaveSnapshotPNG(string prefix = "cap")
     {
-        var dir = Path.Combine(PersistentPath, "heads");
+        var tex = Capture(sourceTexture);
+        if (tex == null) return;
+        var bytes = tex.EncodeToPNG();
+        Destroy(tex);
+        var dir = Path.Combine(PersistentPath, "snaps");
         Directory.CreateDirectory(dir);
-        var full = Path.Combine(dir, filename);
-        var json = JsonUtility.ToJson(head, true);
-        File.WriteAllText(full, json);
+        var file = Path.Combine(dir, $"{prefix}_{(currentClass >= 0 && currentClass < classNames.Count ? classNames[currentClass] : "_")}_{DateTime.Now:yyyyMMdd_HHmmss}.png");
+        File.WriteAllBytes(file, bytes);
+        Debug.Log("[Trainer] PNG -> " + file);
     }
+
+    Texture2D Capture(Texture src)
+    {
+        var rt = src as RenderTexture;
+        if (rt == null) { Debug.LogError("[Trainer] sourceTexture must be a RenderTexture"); return null; }
+        var prev = RenderTexture.active;
+        RenderTexture.active = rt;
+        var tex = new Texture2D(rt.width, rt.height, TextureFormat.RGB24, false);
+        tex.ReadPixels(new Rect(0, 0, rt.width, rt.height), 0, 0);
+        tex.Apply();
+        RenderTexture.active = prev;
+        return tex;
+    }
+    
+
+    // --- Debug helper (safe to call from UI) ---
+public void DebugDump()
+{
+    // classNames: your class list
+    // counts: per-class sample counts (if you keep one; else print "n/a")
+    // embeddingDim: feature dimension set after first sample
+    int classCount = (classNames != null) ? classNames.Count : 0;
+    Debug.Log($"[Trainer] Dump: classes={classCount}, dim={embeddingDim}, currentClass={CurrentClassIndex}");
+
+    // If you maintain 'counts' parallel to classNames, print them; otherwise comment this loop.
+    if (counts != null && counts.Count == classCount)
+    {
+        for (int i = 0; i < classCount; i++)
+        {
+            string lbl = classNames[i];
+            int cnt = counts[i];
+            Debug.Log($"  - [{i}] {lbl} : count={cnt}");
+        }
+    }
+    else
+    {
+        for (int i = 0; i < classCount; i++)
+        {
+            string lbl = classNames[i];
+            Debug.Log($"  - [{i}] {lbl} : count=n/a");
+        }
+    }
+}
+
 }

@@ -27,7 +27,9 @@ public class HeadAutoLoader : MonoBehaviour
 
     void HandleHeadTrained(string fileName, HeadData head)
     {
-        // Already applied by trainer; this is just for logs / UI hooks.
+        // remember and auto-load next run
+        PlayerPrefs.SetString("TinyTeach_LastHead", fileName);
+        PlayerPrefs.Save();
         Debug.Log("[HeadAutoLoader] Remembered head: " + fileName);
     }
 
@@ -40,7 +42,7 @@ public class HeadAutoLoader : MonoBehaviour
         var json = File.ReadAllText(path);
         var head = JsonUtility.FromJson<HeadData>(json);
         classifier.SetHead(head);
-        if (trainer != null && head.classes != null) trainer.ResetAll(head.classes);
+        if (trainer != null && head.classes != null) trainer.ResetAll(new System.Collections.Generic.List<string>(head.classes));
 
         Debug.Log("[HeadAutoLoader] Loaded head -> " + path);
     }

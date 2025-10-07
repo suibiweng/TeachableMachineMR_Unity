@@ -1,38 +1,38 @@
-// Assets/TinyTeachable/Runtime/HeadSwitcherDropdown.cs
-using System;
-using System.Collections.Generic;
-using System.IO;
 using UnityEngine;
-using UnityEngine.UI;
+using System;
+using System.IO;
+using System.Collections.Generic;
 using TMPro;
+using UnityEngine.UI;
 
 [DisallowMultipleComponent]
 public class HeadSwitcherDropdown : MonoBehaviour
 {
     [Header("Pipeline")]
-    public LiveClassifier classifier;          // assign your LiveClassifier
-    public DynamicClassTrainer trainer;        // assign to listen for OnHeadTrained
+    public LiveClassifier classifier;          // REQUIRED
+    public DynamicClassTrainer trainer;        // optional (to refresh trainer UI after load)
 
     [Header("Heads (manual list)")]
-    public List<HeadEntry> heads = new List<HeadEntry>
-    {
-        // Filenames must exist under Application.persistentDataPath/heads/
-        new HeadEntry { label = "Eyes",     fileName = "eyes_v1.json" },
-        new HeadEntry { label = "CupTouch", fileName = "cup_touch_v1.json" }
-    };
+    public List<HeadEntry> heads = new List<HeadEntry>();
 
     [Header("UI (assign one)")]
     public TMP_Dropdown tmpDropdown;           // TextMeshPro dropdown
     public Dropdown     uDropdown;             // Legacy UI dropdown
 
     [Header("Options")]
-    public bool autoLoadFirstOnStart   = true;  // on Start, load first item
-    public bool scanHeadsFolderAtStart = false; // scan /heads/*.json on Start
+    public bool autoLoadFirstOnStart   = true;  // load index 0 at Start
+    public bool scanHeadsFolderAtStart = true;  // scan /heads/*.json at Start
     public string scanPattern           = "*.json";
     public bool includeSubfolders       = false;
-    public bool showModelNameInLabel    = false; // append current embedder name
-    public bool listenForTrainerEvents  = true;  // auto-refresh when trainer saves
-    public bool selectTrainedHead       = true;  // select the newly-trained head
+
+    [Tooltip("If true, we only call classifier.SetHead(head) and DO NOT touch trainer.\nGreat to ensure the head applies immediately and nothing else overwrites it.")]
+    public bool applyToClassifierOnly   = true;
+
+    [Tooltip("If true, when trainer saves a new head we auto-add it to the dropdown and select it.")]
+    public bool listenForTrainerEvents  = true;
+
+    [Tooltip("When handling trainer event, select the newly trained head.")]
+    public bool selectTrainedHead       = true;
 
     [Serializable]
     public class HeadEntry { public string label; public string fileName; }
@@ -53,6 +53,12 @@ public class HeadSwitcherDropdown : MonoBehaviour
 
     void Start()
     {
+        if (classifier == null)
+        {
+            Debug.LogError("[HeadSwitcher] No LiveClassifier assigned.");
+            enabled = false; return;
+        }
+
         if (scanHeadsFolderAtStart) ScanHeadsFolder();
         BuildDropdown();
         HookDropdownEvents();
@@ -61,27 +67,23 @@ public class HeadSwitcherDropdown : MonoBehaviour
             LoadByIndex(0);
     }
 
-    // -------- Trainer event: called after Train & Save --------
+    // ------- Trainer event: invoked after Train & Save -------
     void HandleHeadTrained(string fileName, HeadData head)
     {
-        // Ensure it exists in /heads/
         var path = Path.Combine(PD, "heads", fileName);
         if (!File.Exists(path))
         {
-            Debug.LogWarning("[HeadSwitcher] Trained head file not found at: " + path);
+            Debug.LogWarning("[HeadSwitcher] Trained head not found on disk: " + path);
             return;
         }
 
-        // Add/update entry in list
         string label = Path.GetFileNameWithoutExtension(fileName);
         int idx = FindIndexByFile(fileName);
         if (idx < 0) heads.Add(new HeadEntry { label = label, fileName = fileName });
-        else heads[idx].label = label; // keep label in sync
+        else heads[idx].label = label;
 
-        // Rebuild UI
         BuildDropdown();
 
-        // Select & load the freshly trained head
         if (selectTrainedHead)
         {
             int i = FindIndexByFile(fileName);
@@ -105,11 +107,10 @@ public class HeadSwitcherDropdown : MonoBehaviour
 
     public void LoadByIndex(int i)
     {
-        if (i < 0 || i >= heads.Count) return;
+        if (i < 0 || i >= heads.Count) { Debug.LogWarning("[HeadSwitcher] Bad index " + i); return; }
         var entry = heads[i];
         LoadHead(entry.fileName);
 
-        // keep UI selection in sync if changed programmatically
         if (tmpDropdown) { tmpDropdown.SetValueWithoutNotify(i); tmpDropdown.RefreshShownValue(); }
         if (uDropdown)   { uDropdown.SetValueWithoutNotify(i);   uDropdown.RefreshShownValue();   }
     }
@@ -120,12 +121,20 @@ public class HeadSwitcherDropdown : MonoBehaviour
         if (tmpDropdown)
         {
             tmpDropdown.onValueChanged.RemoveAllListeners();
-            tmpDropdown.onValueChanged.AddListener(LoadByIndex);
+            tmpDropdown.onValueChanged.AddListener(i =>
+            {
+                Debug.Log("[HeadSwitcher] TMP onValueChanged -> " + i);
+                LoadByIndex(i);
+            });
         }
         else if (uDropdown)
         {
             uDropdown.onValueChanged.RemoveAllListeners();
-            uDropdown.onValueChanged.AddListener(LoadByIndex);
+            uDropdown.onValueChanged.AddListener(i =>
+            {
+                Debug.Log("[HeadSwitcher] UGUI onValueChanged -> " + i);
+                LoadByIndex(i);
+            });
         }
         else
         {
@@ -136,29 +145,26 @@ public class HeadSwitcherDropdown : MonoBehaviour
     void BuildDropdown()
     {
         var labels = new List<string>(heads.Count);
-        string modelSuffix = (showModelNameInLabel && classifier && classifier.embedder && classifier.embedder.modelAsset)
-            ? $"  (Model: {classifier.embedder.modelAsset.name})"
-            : "";
-
-        foreach (var h in heads) labels.Add(h.label + modelSuffix);
+        foreach (var h in heads) labels.Add(h.label);
 
         if (tmpDropdown)
         {
             tmpDropdown.ClearOptions();
             tmpDropdown.AddOptions(labels);
             tmpDropdown.RefreshShownValue();
+            Debug.Log("[HeadSwitcher] TMP options: " + string.Join(", ", labels));
         }
         else if (uDropdown)
         {
             uDropdown.ClearOptions();
             uDropdown.AddOptions(labels);
             uDropdown.RefreshShownValue();
+            Debug.Log("[HeadSwitcher] UGUI options: " + string.Join(", ", labels));
         }
     }
 
     void LoadHead(string fileName)
     {
-        if (classifier == null) { Debug.LogError("[HeadSwitcher] No classifier assigned."); return; }
         var path = Path.Combine(PD, "heads", fileName);
         if (!File.Exists(path))
         {
@@ -168,12 +174,39 @@ public class HeadSwitcherDropdown : MonoBehaviour
 
         var json = File.ReadAllText(path);
         var head = JsonUtility.FromJson<HeadData>(json);
-        classifier.SetHead(head);
 
-        if (trainer != null && head.classes != null)
-            trainer.ResetAll(head.classes); // sync trainer class list
+        // sanity check
+        if (!HeadLooksUsable(head))
+        {
+            Debug.LogError("[HeadSwitcher] Head JSON invalid or empty: " + fileName);
+            return;
+        }
 
-        Debug.Log("[HeadSwitcher] Loaded -> " + path);
+        if (applyToClassifierOnly || trainer == null)
+        {
+            classifier.SetHead(head);
+            Debug.Log($"[HeadSwitcher] Applied to classifier ONLY -> {fileName}");
+        }
+        else
+        {
+            // sync trainer classes for UI, then apply to classifier
+            if (head.classes != null) trainer.ResetAll(new List<string>(head.classes));
+            classifier.SetHead(head);
+            Debug.Log($"[HeadSwitcher] Loaded (trainer+classifier) -> {fileName}");
+        }
+
+        // Confirm live head set
+        if (!classifier.IsHeadReady())
+            Debug.LogWarning("[HeadSwitcher] Warning: classifier reports head not ready after SetHead.");
+
+        // Log quick summary
+        int dim = -1;
+        if (head.type == "centroid" && head.centroids != null && head.centroids.Length > 0 && head.centroids[0] != null)
+            dim = head.centroids[0].Length;
+        else if (head.type == "linear" && head.W != null)
+            dim = head.W.GetLength(0);
+
+        Debug.Log($"[HeadSwitcher] Head summary -> type={head.type}, dim={dim}, classes={(head.classes!=null?head.classes.Length:0)}");
     }
 
     void ScanHeadsFolder()
@@ -193,6 +226,8 @@ public class HeadSwitcherDropdown : MonoBehaviour
             heads.Add(new HeadEntry { label = nameNoExt, fileName = file });
         }
         heads.Sort((a, b) => string.Compare(a.label, b.label, StringComparison.OrdinalIgnoreCase));
+
+        Debug.Log($"[HeadSwitcher] Scan -> found {heads.Count} head(s) in {dir}");
     }
 
     int FindIndexByFile(string fileName)
@@ -201,5 +236,15 @@ public class HeadSwitcherDropdown : MonoBehaviour
             if (string.Equals(heads[i].fileName, fileName, StringComparison.OrdinalIgnoreCase))
                 return i;
         return -1;
+    }
+
+    bool HeadLooksUsable(HeadData h)
+    {
+        if (h == null || h.classes == null || h.classes.Length == 0) return false;
+        if (h.type == "centroid")
+            return h.centroids != null && h.centroids.Length == h.classes.Length && h.centroids[0] != null && h.centroids[0].Length > 0;
+        if (h.type == "linear")
+            return h.W != null && h.W.GetLength(1) == h.classes.Length && h.W.GetLength(0) > 0;
+        return false;
     }
 }

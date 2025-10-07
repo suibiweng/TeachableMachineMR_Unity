@@ -1,33 +1,57 @@
 using UnityEngine;
-using TMPro;                 // TextMeshPro
-using UnityEngine.UI;       // UI Image
+using TMPro;  // or swap to UnityEngine.UI.Text if you prefer
 
+[DisallowMultipleComponent]
 public class LiveClassifierUI : MonoBehaviour
 {
-    [Header("Wiring")]
-    public LiveClassifier classifier;         // drag your LiveClassifier here
+    [Header("Source")]
+    public LiveClassifier classifier;     // drag your existing LiveClassifier here
 
-    [Header("UI Targets")]
-    public TMP_Text modelText;                // NEW: shows ModelAsset name
-    public TMP_Text labelText;                // shows predicted label
-    public TMP_Text scoreText;                // shows confidence
-    public Image    statusLight;              // optional: colored by confidence
+    [Header("UI (assign any you want)")]
+    public TMP_Text labelText;
+    public TMP_Text scoreText;
+    public TMP_Text modelText;
+    public TMP_Text headText;
+    public TMP_Text fpsText;
 
-    [Header("Display")]
-    public string modelPrefix = "Model: ";
-    public string labelPrefix = "Label: ";
-    public string scorePrefix = "Score: ";
-    [Range(0f,1f)] public float confGood = 0.80f;
-    [Range(0f,1f)] public float confWarn = 0.50f;
+    [Header("Formatting")]
+    public string scoreFormat = "0.00";
+    public string fpsFormat   = "0.0";
 
-    // cache to avoid re-writing the same model name every frame
-    string _lastModelName = null;
+    [Header("Behavior")]
+    public bool pollEachFrame = true;     // fallback: poll classifier state every frame
+
+    float _lastFpsTime;
+    int   _framesSince;
+    string _lastShownLabel = "";
+    float  _lastShownScore = float.NaN;
 
     void OnEnable()
     {
         if (classifier != null)
             classifier.OnPrediction += HandlePrediction;
-        RefreshModelName(); // try once now
+
+        _lastFpsTime   = Time.realtimeSinceStartup;
+        _framesSince   = 0;
+
+        // initial UI state
+        var initLabel = classifier != null ? classifier.LastLabel : "";
+        var initScore = classifier != null ? classifier.LastScore : 0f;
+        PushTexts(initLabel, initScore, force:true);
+
+        if (modelText) modelText.text = classifier && classifier.embedder && classifier.embedder.modelAsset
+            ? $"Model: {classifier.embedder.modelAsset.name}"
+            : "Model: (none)";
+
+        // head name from prefs or current head class count
+        if (headText)
+        {
+            var last = PlayerPrefs.GetString("TinyTeach_LastHead", "");
+            if (!string.IsNullOrEmpty(last)) headText.text = $"Head: {last}";
+            else if (classifier != null && classifier.CurrentHead != null && classifier.CurrentHead.classes != null)
+                headText.text = $"Head: ({classifier.CurrentHead.classes.Length} classes)";
+            else headText.text = "Head: (unset)";
+        }
     }
 
     void OnDisable()
@@ -36,46 +60,54 @@ public class LiveClassifierUI : MonoBehaviour
             classifier.OnPrediction -= HandlePrediction;
     }
 
-    void Start()
-    {
-        // If classifier already predicted before UI enabled, populate immediately
-        if (classifier != null && !string.IsNullOrEmpty(classifier.LastLabel))
-            HandlePrediction(classifier.LastLabel, classifier.LastScore);
-        RefreshModelName();
-    }
-
     void Update()
     {
-        // In case you hot-swap the ModelAsset at runtime, keep the name fresh (cheap check)
-        RefreshModelName();
-    }
-
-    void RefreshModelName()
-    {
-        if (modelText == null || classifier == null) return;
-
-        // Pull name from SentisEmbedder's ModelAsset (UnityEngine.Object has .name)
-        var embedder = classifier.embedder;
-        string name = (embedder != null && embedder.modelAsset != null) ? embedder.modelAsset.name : "(no model)";
-
-        if (!string.Equals(name, _lastModelName))
+        // FPS (optional)
+        _framesSince++;
+        float dt = Time.realtimeSinceStartup - _lastFpsTime;
+        if (dt >= 0.5f)
         {
-            _lastModelName = name;
-            modelText.text = $"{modelPrefix}{name}";
+            if (fpsText)
+            {
+                float fps = _framesSince / dt;
+                fpsText.text = $"FPS: {fps.ToString(fpsFormat)}";
+            }
+            _framesSince = 0; _lastFpsTime = Time.realtimeSinceStartup;
+        }
+
+        // Keep model name up to date if you hot-swap models
+        if (modelText && classifier && classifier.embedder)
+        {
+            var ma = classifier.embedder.modelAsset;
+            modelText.text = $"Model: {(ma ? ma.name : "(none)")}";
+        }
+
+        // Fallback polling: if events didn’t fire (or missed), show the latest state
+        if (pollEachFrame && classifier != null)
+        {
+            var lbl = classifier.LastLabel;
+            var scr = classifier.LastScore;
+            // Only push if changed to avoid string churn
+            if (lbl != _lastShownLabel || scr != _lastShownScore)
+                PushTexts(lbl, scr);
         }
     }
 
     void HandlePrediction(string label, float score)
     {
-        if (labelText) labelText.text = $"{labelPrefix}{label}";
-        if (scoreText) scoreText.text = $"{scorePrefix}{score:F2}";
+        // Event-driven update (preferred when it fires)
+        PushTexts(label, score);
+    }
 
-        if (statusLight)
-        {
-            // simple traffic light based on confidence
-            if (score >= confGood)      statusLight.color = new Color(0.25f, 0.85f, 0.35f); // green
-            else if (score >= confWarn) statusLight.color = new Color(0.95f, 0.75f, 0.25f); // yellow
-            else                        statusLight.color = new Color(0.9f, 0.35f, 0.35f);  // red
-        }
+    void PushTexts(string label, float score, bool force=false)
+    {
+        if (labelText && (force || label != _lastShownLabel))
+            labelText.text = string.IsNullOrEmpty(label) ? "Label: —" : $"Label: {label}";
+
+        if (scoreText && (force || score != _lastShownScore))
+            scoreText.text = $"Score: {score.ToString(scoreFormat)}";
+
+        _lastShownLabel = label;
+        _lastShownScore = score;
     }
 }
