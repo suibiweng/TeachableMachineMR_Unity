@@ -4,8 +4,16 @@
 EditorBuildSettings:
   m_ObjectHideFlags: 0
   serializedVersion: 2
-  m_Scenes: []
+  m_Scenes:
+  - enabled: 1
+    path: Assets/Scenes/TinyTMMR.unity
+    guid: ccb585454eefe4076ad3273fcc407f0c
+  - enabled: 1
+    path: Assets/Scenes/Test.unity
+    guid: b7f8f1d6b7955384bb588518579a88b1
   m_configObjects:
+    Unity.XR.Oculus.Settings: {fileID: 11400000, guid: 27e86db0aeff59d41990451337385f77, type: 2}
     com.unity.input.settings.actions: {fileID: -944628639613478452, guid: 289c1b55c9541489481df5cc06664110, type: 3}
     com.unity.xr.management.loader_settings: {fileID: 11400000, guid: d4e60891815bfda4681a716820041412, type: 2}
+    com.unity.xr.openxr.settings4: {fileID: 11400000, guid: 576d46194c5016b45947223dd319a4d4, type: 2}
   m_UseUCBPForAssetBundles: 0
