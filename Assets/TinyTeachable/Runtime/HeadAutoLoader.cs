@@ -1,49 +1,45 @@
-using UnityEngine;
+// Assets/TinyTeachable/Runtime/HeadAutoLoader.cs
 using System.IO;
+using UnityEngine;
 
 [DisallowMultipleComponent]
 public class HeadAutoLoader : MonoBehaviour
 {
-    public LiveClassifier classifier;   // assign
-    public DynamicClassTrainer trainer; // optional: keeps trainer UI in sync
+    [Header("Links")]
+    public LiveClassifier classifier;   // assign in Inspector (required)
 
-    string PD => Application.persistentDataPath;
+    [Header("Settings")]
+    public string headsFolder = "heads";                        // subfolder under persistentDataPath
+    public string prefsKeyFile = "TinyTeach_LastHead";          // must match DetectionManager
+    public string prefsKeyName = "TinyTeach_LastHeadName";      // optional, for logging/UI
 
     void Awake()
     {
-        if (trainer) trainer.OnHeadTrained += HandleHeadTrained;
-    }
-
-    void OnDestroy()
-    {
-        if (trainer) trainer.OnHeadTrained -= HandleHeadTrained;
+        if (classifier == null)
+        {
+            classifier = FindObjectOfType<LiveClassifier>();
+        }
     }
 
     void Start()
     {
-        var last = PlayerPrefs.GetString("TinyTeach_LastHead", "");
-        if (!string.IsNullOrEmpty(last)) LoadHead(last);
-    }
+        var file = PlayerPrefs.GetString(prefsKeyFile, "");
+        if (string.IsNullOrEmpty(file))
+        {
+            Debug.Log("[HeadAutoLoader] No last head saved.");
+            return;
+        }
 
-    void HandleHeadTrained(string fileName, HeadData head)
-    {
-        // remember and auto-load next run
-        PlayerPrefs.SetString("TinyTeach_LastHead", fileName);
-        PlayerPrefs.Save();
-        Debug.Log("[HeadAutoLoader] Remembered head: " + fileName);
-    }
+        var fullPath = Path.Combine(Application.persistentDataPath, headsFolder, file);
+        if (!File.Exists(fullPath))
+        {
+            Debug.LogWarning("[HeadAutoLoader] Last head file missing: " + fullPath);
+            return;
+        }
 
-    public void LoadHead(string fileName)
-    {
-        if (classifier == null) { Debug.LogError("[HeadAutoLoader] No classifier."); return; }
-        var path = Path.Combine(PD, "heads", fileName);
-        if (!File.Exists(path)) { Debug.LogWarning("[HeadAutoLoader] Head not found: " + path); return; }
+        classifier.LoadHeadFromPath(fullPath);
 
-        var json = File.ReadAllText(path);
-        var head = JsonUtility.FromJson<HeadData>(json);
-        classifier.SetHead(head);
-        if (trainer != null && head.classes != null) trainer.ResetAll(new System.Collections.Generic.List<string>(head.classes));
-
-        Debug.Log("[HeadAutoLoader] Loaded head -> " + path);
+        var name = PlayerPrefs.GetString(prefsKeyName, Path.GetFileNameWithoutExtension(file));
+        Debug.Log("[HeadAutoLoader] Loaded last head on boot: " + name);
     }
 }

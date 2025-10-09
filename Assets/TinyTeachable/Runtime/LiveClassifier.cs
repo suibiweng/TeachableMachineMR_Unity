@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using UnityEngine;
 
 [DisallowMultipleComponent]
@@ -10,154 +11,176 @@ public class LiveClassifier : MonoBehaviour
     public TextAsset defaultHeadJson;   // optional: start with a head
 
     [Header("Frequency & Smoothing")]
+    [Tooltip("Run inference every N frames (>=1).")]
     public int classifyEvery = 2;       // run every N frames
+    [Tooltip("Majority window (0 = off). Keeps last K predicted labels and votes the most common).")]
     public int smooth = 5;              // majority window (0 = off)
 
     // UI / other systems can subscribe to this
     public event Action<string, float> OnPrediction;
+    public event Action<HeadData> OnHeadChanged;
 
-    // Latest output
+    [Header("Read-only")]
+    [SerializeField] private string currentHeadName = "(none)";
+    public string CurrentHeadName => currentHeadName;
+
     public string LastLabel { get; private set; } = "";
     public float  LastScore { get; private set; } = 0f;
 
-    // For UI
-    public HeadData CurrentHead => head;
-
-    // internal
+    // State
     private HeadData head;
-    private int frameIdx;
-    private System.Collections.Generic.Queue<int> smoothQ = new System.Collections.Generic.Queue<int>();
+    private int frameGate = 0;
+    private Queue<string> recentLabels;   // for smoothing
+
+    void Awake()
+    {
+        if (smooth > 0) recentLabels = new Queue<string>(Mathf.Max(1, smooth));
+        if (classifyEvery < 1) classifyEvery = 1;
+    }
 
     void Start()
     {
-        // Only load default if we do NOT already have a valid head (e.g. HeadSwitcher/AutoLoader may set first)
-        if (defaultHeadJson != null && !string.IsNullOrEmpty(defaultHeadJson.text))
+        // Optional default head (only if nothing else loaded one first)
+        if (!IsHeadReady() && defaultHeadJson != null && !string.IsNullOrEmpty(defaultHeadJson.text))
         {
-            if (!IsHeadReady())
+            try
             {
                 var h = JsonUtility.FromJson<HeadData>(defaultHeadJson.text);
                 if (HeadLooksUsable(h))
                 {
-                    SetHead(h);
-                    Debug.Log("[LiveClassifier] Loaded default head from TextAsset.");
+                    SetHead(h, "(default)");
+                    Debug.Log("[LiveClassifier] Loaded default head.");
                 }
-                else
-                {
-                    Debug.LogWarning("[LiveClassifier] defaultHeadJson is empty/invalid; skipping.");
-                }
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning("[LiveClassifier] Failed to parse default head: " + e.Message);
             }
         }
     }
 
-    // Guard: check if head has usable data
+    void Update()
+    {
+        if (embedder == null || sourceTexture == null || !IsHeadReady()) return;
+        if ((frameGate++ % Mathf.Max(1, classifyEvery)) != 0) return;
+
+        var z = embedder.Embed(sourceTexture);
+        if (z == null || z.Length == 0) return;
+
+        // Score using TinyHeads helpers that exist: PredictCentroid/PredictLinear
+        int idx = -1; float score = 0f;
+        if (head.type == "centroid")
+        {
+            (idx, score) = TinyHeads.PredictCentroid(z, head);
+        }
+        else if (head.type == "linear")
+        {
+            (idx, score) = TinyHeads.PredictLinear(z, head);
+        }
+        else
+        {
+            Debug.LogWarning("[LiveClassifier] Unknown head.type: " + head.type);
+            return;
+        }
+
+        if (head.classes == null || head.classes.Length == 0 || idx < 0) return;
+        idx = Mathf.Clamp(idx, 0, head.classes.Length - 1);
+        string label = head.classes[idx];
+
+        // Optional smoothing (majority voting)
+        if (smooth > 0)
+        {
+            if (recentLabels == null) recentLabels = new Queue<string>(smooth);
+            recentLabels.Enqueue(label);
+            while (recentLabels.Count > smooth) recentLabels.Dequeue();
+            label = Majority(recentLabels);
+        }
+
+        LastLabel = label;
+        LastScore = score;
+        OnPrediction?.Invoke(label, score);
+    }
+
+    // ------------------- Public API -------------------
+
+    public void SetHead(HeadData newHead, string nameOverride = null)
+    {
+        if (!HeadLooksUsable(newHead))
+        {
+            Debug.LogWarning("[LiveClassifier] SetHead rejected: invalid head.");
+            return;
+        }
+
+        head = newHead;
+        if (!string.IsNullOrEmpty(nameOverride)) currentHeadName = nameOverride;
+
+        // Reset smoothing window so we don't mix old labels with new head
+        if (recentLabels != null) recentLabels.Clear();
+
+        OnHeadChanged?.Invoke(head);
+        Debug.Log($"[LiveClassifier] Head set: type={head.type}, classes={head.classes?.Length ?? 0}");
+    }
+
+    /// Load head JSON text (already read) and apply.
+    public void LoadHeadFromJson(string json, string nameHint = null)
+    {
+        try
+        {
+            var h = JsonUtility.FromJson<HeadData>(json);
+            if (!HeadLooksUsable(h)) { Debug.LogWarning("[LiveClassifier] LoadHeadFromJson invalid."); return; }
+            currentHeadName = string.IsNullOrEmpty(nameHint) ? currentHeadName : nameHint;
+            SetHead(h, currentHeadName);
+        }
+        catch (Exception e)
+        {
+            Debug.LogError("[LiveClassifier] LoadHeadFromJson failed: " + e.Message);
+        }
+    }
+
+    /// Load head from a file path and apply.
+    public void LoadHeadFromPath(string fullPath)
+    {
+        try
+        {
+            if (!System.IO.File.Exists(fullPath)) { Debug.LogError("[LiveClassifier] Head path missing: " + fullPath); return; }
+            var json = System.IO.File.ReadAllText(fullPath);
+            var nameHint = System.IO.Path.GetFileNameWithoutExtension(fullPath);
+            LoadHeadFromJson(json, nameHint);
+        }
+        catch (Exception e)
+        {
+            Debug.LogError("[LiveClassifier] LoadHeadFromPath failed: " + e.Message);
+        }
+    }
+
+    /// Used by other scripts (e.g., HeadSwitcherDropdown) to check readiness.
+    public bool IsHeadReady()
+    {
+        return HeadLooksUsable(head);
+    }
+
+    // ------------------- Helpers -------------------
+
     private bool HeadLooksUsable(HeadData h)
     {
         if (h == null || h.classes == null || h.classes.Length == 0) return false;
         if (h.type == "centroid")
             return h.centroids != null && h.centroids.Length == h.classes.Length && h.centroids[0] != null && h.centroids[0].Length > 0;
         if (h.type == "linear")
-            return h.W != null && h.W.GetLength(0) > 0 && h.W.GetLength(1) == h.classes.Length;
+            return h.W != null && h.W.GetLength(1) == h.classes.Length && h.W.GetLength(0) > 0;
         return false;
     }
 
-    /// <summary>Apply a new head. For centroid heads, centroids are L2-normalized. Skips empty heads.</summary>
-    public void SetHead(HeadData h)
+    private static string Majority(IEnumerable<string> labels)
     {
-        if (!HeadLooksUsable(h))
+        string best = null; int bestCount = -1;
+        var map = new Dictionary<string, int>();
+        foreach (var l in labels)
         {
-            Debug.LogWarning("[LiveClassifier] SetHead skipped: head is null/empty.");
-            return;
+            if (string.IsNullOrEmpty(l)) continue;
+            map.TryGetValue(l, out var c); c++; map[l] = c;
+            if (c > bestCount) { bestCount = c; best = l; }
         }
-
-        head = h;
-
-        if (head.type == "centroid" && head.centroids != null)
-        {
-            for (int c = 0; c < head.centroids.Length; c++)
-                TinyHeads.L2Normalize(head.centroids[c]);
-        }
-
-        LastLabel = ""; LastScore = 0f; smoothQ.Clear();
-
-        int clsCount = (head.classes != null) ? head.classes.Length : 0;
-        int dim = -1;
-        if (head.type == "centroid")
-            dim = (head.centroids != null && head.centroids.Length > 0 && head.centroids[0] != null) ? head.centroids[0].Length : -1;
-        else if (head.type == "linear" && head.W != null)
-            dim = head.W.GetLength(0); // W[D,C]
-
-        Debug.Log($"[LiveClassifier] Head set: type={head.type}, dim={dim}, classes={clsCount}");
-    }
-
-    /// <summary>Load head JSON from an absolute path and apply if valid.</summary>
-    public void LoadHeadFromPath(string path)
-    {
-        if (!System.IO.File.Exists(path))
-        {
-            Debug.LogError("[LiveClassifier] Head file missing: " + path);
-            return;
-        }
-        var json = System.IO.File.ReadAllText(path);
-        var h = JsonUtility.FromJson<HeadData>(json);
-        SetHead(h);
-        Debug.Log("[LiveClassifier] Loaded head from: " + path);
-    }
-
-    /// <summary>Returns true if a usable head is present.</summary>
-    public bool IsHeadReady()
-    {
-        return HeadLooksUsable(head);
-    }
-
-    void Update()
-    {
-        if (embedder == null || sourceTexture == null) return;
-        if (!IsHeadReady()) return;
-
-        frameIdx++;
-        if (frameIdx % Mathf.Max(1, classifyEvery) != 0) return;
-
-        // 1) Embed
-        var z = embedder.Embed(sourceTexture);
-        if (z == null || z.Length == 0) return;
-
-        // 2) Predict
-        int idx; float score;
-        if (head.type == "centroid")
-        {
-            TinyHeads.L2Normalize(z);
-            (idx, score) = TinyHeads.PredictCentroid(z, head);  // (bestIndex, cosineScore)
-        }
-        else // "linear"
-        {
-            (idx, score) = TinyHeads.PredictLinear(z, head);    // (bestIndex, softmaxProb) with W[D,C]
-        }
-
-        // 3) Optional temporal smoothing (majority vote)
-        if (smooth > 0)
-        {
-            smoothQ.Enqueue(idx);
-            while (smoothQ.Count > smooth) smoothQ.Dequeue();
-
-            int best = idx, bestCnt = 0;
-            var counts = new System.Collections.Generic.Dictionary<int, int>();
-            foreach (var k in smoothQ)
-            {
-                if (!counts.ContainsKey(k)) counts[k] = 0;
-                counts[k]++;
-                if (counts[k] > bestCnt) { bestCnt = counts[k]; best = k; }
-            }
-            idx = best;
-        }
-
-        string label = (head.classes != null && idx >= 0 && idx < head.classes.Length) ? head.classes[idx] : idx.ToString();
-
-        LastLabel = label;
-        LastScore = score;
-
-        OnPrediction?.Invoke(label, score);
-
-        if (Time.frameCount % 15 == 0)
-            Debug.Log($"[LiveClassifier] Prediction: {label} ({score:0.00})");
+        return best ?? "";
     }
 }
