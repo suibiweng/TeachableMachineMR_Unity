@@ -1,186 +1,308 @@
+// Assets/TinyTeachable/Runtime/LiveClassifier.cs
 using System;
+using System.IO;
 using System.Collections.Generic;
+using System.Reflection;
 using UnityEngine;
 
 [DisallowMultipleComponent]
 public class LiveClassifier : MonoBehaviour
 {
     [Header("Links")]
-    public SentisEmbedder embedder;     // assign in Inspector
-    public Texture sourceTexture;       // 224x224 RT (webcam/passthrough)
-    public TextAsset defaultHeadJson;   // optional: start with a head
+    public SentisEmbedder embedder;
+    public Texture sourceTexture;
+    public TextAsset defaultHeadJson;
 
-    [Header("Frequency & Smoothing")]
-    [Tooltip("Run inference every N frames (>=1).")]
-    public int classifyEvery = 2;       // run every N frames
-    [Tooltip("Majority window (0 = off). Keeps last K predicted labels and votes the most common).")]
-    public int smooth = 5;              // majority window (0 = off)
+    [Header("Runtime Controls")]
+    public int classifyEvery = 2;
+    public int smooth = 5;
 
-    // UI / other systems can subscribe to this
+    [Header("Console Debug")]
+    public bool consoleDebug = true;
+    public bool logPredictions = true;
+
+    [Header("State (read-only)")]
+    public string LastLabel { get; private set; } = "";
+    public float  LastScore { get; private set; } = 0f;
+    public string CurrentHeadName { get; private set; } = "";
+    public bool   IsRunning { get; private set; } = true;
+
+    // === Head enforcement ===
+    [Header("Head Enforcement")]
+    [Tooltip("If true, SetHead() calls with a different name will be ignored unless forced.")]
+    public bool EnforcePreferredHead = false;
+
+    [Tooltip("When EnforcePreferredHead is true, only this head name will be accepted.")]
+    public string PreferredHeadName = "";
+
     public event Action<string, float> OnPrediction;
     public event Action<HeadData> OnHeadChanged;
 
-    [Header("Read-only")]
-    [SerializeField] private string currentHeadName = "(none)";
-    public string CurrentHeadName => currentHeadName;
-
-    public string LastLabel { get; private set; } = "";
-    public float  LastScore { get; private set; } = 0f;
-
-    // State
     private HeadData head;
-    private int frameGate = 0;
-    private Queue<string> recentLabels;   // for smoothing
-
-    void Awake()
-    {
-        if (smooth > 0) recentLabels = new Queue<string>(Mathf.Max(1, smooth));
-        if (classifyEvery < 1) classifyEvery = 1;
-    }
+    private int frameIdx;
+    private readonly Queue<int> smoothQ = new();
+    private string _lastSkipPrinted = "";
+    private int _ticks = 0;
 
     void Start()
     {
-        // Optional default head (only if nothing else loaded one first)
-        if (!IsHeadReady() && defaultHeadJson != null && !string.IsNullOrEmpty(defaultHeadJson.text))
+        if (defaultHeadJson != null && !string.IsNullOrEmpty(defaultHeadJson.text) && !IsHeadReady())
         {
             try
             {
                 var h = JsonUtility.FromJson<HeadData>(defaultHeadJson.text);
-                if (HeadLooksUsable(h))
-                {
-                    SetHead(h, "(default)");
-                    Debug.Log("[LiveClassifier] Loaded default head.");
-                }
+                if (HeadLooksUsable(h)) { SetHead(h, "(default TextAsset)", force:false); DLog("[LC] Loaded default head TextAsset."); }
+                else DWarn("[LC] defaultHeadJson invalid.");
             }
-            catch (Exception e)
-            {
-                Debug.LogWarning("[LiveClassifier] Failed to parse default head: " + e.Message);
-            }
+            catch (Exception e) { DErr("[LC] defaultHeadJson parse error: " + e.Message); }
         }
     }
 
     void Update()
     {
-        if (embedder == null || sourceTexture == null || !IsHeadReady()) return;
-        if ((frameGate++ % Mathf.Max(1, classifyEvery)) != 0) return;
+        if (!IsRunning) { Skip("IsRunning=false"); return; }
+        if (classifyEvery < 1) classifyEvery = 1;
+        frameIdx++;
+        if ((frameIdx % classifyEvery) != 0) { Skip("throttled"); return; }
+        if (!IsHeadReady()) { Skip("no head"); return; }
+        if (embedder == null) { Skip("embedder not assigned"); return; }
 
-        var z = embedder.Embed(sourceTexture);
-        if (z == null || z.Length == 0) return;
+        var z = GetEmbedding();
+        int zLen = z != null ? z.Length : 0;
+        if (zLen == 0) { Skip("no embedding"); return; }
 
-        // Score using TinyHeads helpers that exist: PredictCentroid/PredictLinear
-        int idx = -1; float score = 0f;
-        if (head.type == "centroid")
-        {
-            (idx, score) = TinyHeads.PredictCentroid(z, head);
-        }
-        else if (head.type == "linear")
-        {
-            (idx, score) = TinyHeads.PredictLinear(z, head);
-        }
-        else
-        {
-            Debug.LogWarning("[LiveClassifier] Unknown head.type: " + head.type);
-            return;
-        }
+        var (idx, score) = Score(z);
+        if (idx < 0) { Skip("score idx < 0"); return; }
 
-        if (head.classes == null || head.classes.Length == 0 || idx < 0) return;
-        idx = Mathf.Clamp(idx, 0, head.classes.Length - 1);
-        string label = head.classes[idx];
-
-        // Optional smoothing (majority voting)
         if (smooth > 0)
         {
-            if (recentLabels == null) recentLabels = new Queue<string>(smooth);
-            recentLabels.Enqueue(label);
-            while (recentLabels.Count > smooth) recentLabels.Dequeue();
-            label = Majority(recentLabels);
+            smoothQ.Enqueue(idx);
+            while (smoothQ.Count > smooth) smoothQ.Dequeue();
+            idx = MajorityIndex(smoothQ);
         }
+
+        string label = (head.classes != null && idx >= 0 && idx < head.classes.Length) ? head.classes[idx] : idx.ToString();
 
         LastLabel = label;
         LastScore = score;
+        _ticks++;
+
+        if (logPredictions)
+            DLog($"[LC] ✓ Pred #{_ticks}  head='{CurrentHeadName}'  idx={idx}  label='{label}'  score={score:0.000}  embLen={zLen}  classes=[{ClassesPreview(head)}]");
+
         OnPrediction?.Invoke(label, score);
+        _lastSkipPrinted = "";
     }
 
-    // ------------------- Public API -------------------
-
-    public void SetHead(HeadData newHead, string nameOverride = null)
-    {
-        if (!HeadLooksUsable(newHead))
-        {
-            Debug.LogWarning("[LiveClassifier] SetHead rejected: invalid head.");
-            return;
-        }
-
-        head = newHead;
-        if (!string.IsNullOrEmpty(nameOverride)) currentHeadName = nameOverride;
-
-        // Reset smoothing window so we don't mix old labels with new head
-        if (recentLabels != null) recentLabels.Clear();
-
-        OnHeadChanged?.Invoke(head);
-        Debug.Log($"[LiveClassifier] Head set: type={head.type}, classes={head.classes?.Length ?? 0}");
-    }
-
-    /// Load head JSON text (already read) and apply.
-    public void LoadHeadFromJson(string json, string nameHint = null)
+    // ------------- Embedding -------------
+    float[] GetEmbedding()
     {
         try
         {
-            var h = JsonUtility.FromJson<HeadData>(json);
-            if (!HeadLooksUsable(h)) { Debug.LogWarning("[LiveClassifier] LoadHeadFromJson invalid."); return; }
-            currentHeadName = string.IsNullOrEmpty(nameHint) ? currentHeadName : nameHint;
-            SetHead(h, currentHeadName);
+            if (sourceTexture != null)
+            {
+                var m = typeof(SentisEmbedder).GetMethod("Embed", new[] { typeof(Texture) });
+                if (m != null)
+                {
+                    var res = m.Invoke(embedder, new object[] { sourceTexture }) as float[];
+                    if (res != null && res.Length > 0) return res;
+                    Skip("Embed(Texture) returned null/empty.");
+                }
+            }
+            else Skip("sourceTexture not assigned.");
         }
-        catch (Exception e)
-        {
-            Debug.LogError("[LiveClassifier] LoadHeadFromJson failed: " + e.Message);
-        }
-    }
+        catch (Exception e) { DErr("Embed(Texture) threw: " + e.Message); }
 
-    /// Load head from a file path and apply.
-    public void LoadHeadFromPath(string fullPath)
-    {
         try
         {
-            if (!System.IO.File.Exists(fullPath)) { Debug.LogError("[LiveClassifier] Head path missing: " + fullPath); return; }
-            var json = System.IO.File.ReadAllText(fullPath);
-            var nameHint = System.IO.Path.GetFileNameWithoutExtension(fullPath);
-            LoadHeadFromJson(json, nameHint);
+            var m = typeof(SentisEmbedder).GetMethod("Embed", Type.EmptyTypes);
+            if (m != null)
+            {
+                var res = m.Invoke(embedder, null) as float[];
+                if (res != null && res.Length > 0) return res;
+                Skip("Embed() returned null/empty.");
+            }
         }
-        catch (Exception e)
+        catch (Exception e) { DErr("Embed() threw: " + e.Message); }
+
+        try
         {
-            Debug.LogError("[LiveClassifier] LoadHeadFromPath failed: " + e.Message);
+            var m = typeof(SentisEmbedder).GetMethod("GetLastEmbedding", Type.EmptyTypes);
+            if (m != null)
+            {
+                var res = m.Invoke(embedder, null) as float[];
+                if (res != null && res.Length > 0) return res;
+                Skip("GetLastEmbedding() returned null/empty.");
+            }
         }
+        catch (Exception e) { DErr("GetLastEmbedding() threw: " + e.Message); }
+
+        foreach (var pname in new[] { "LastEmbedding", "LatestEmbedding", "lastEmbedding", "Embedding", "embedding" })
+        {
+            try
+            {
+                var p = typeof(SentisEmbedder).GetProperty(pname, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (p != null)
+                {
+                    var arr = p.GetValue(embedder) as float[];
+                    if (arr != null && arr.Length > 0) return arr;
+                }
+                var f = typeof(SentisEmbedder).GetField(pname, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (f != null)
+                {
+                    var arr = f.GetValue(embedder) as float[];
+                    if (arr != null && arr.Length > 0) return arr;
+                }
+            }
+            catch (Exception e) { DErr($"Read {pname} threw: " + e.Message); }
+        }
+        return null;
     }
 
-    /// Used by other scripts (e.g., HeadSwitcherDropdown) to check readiness.
-    public bool IsHeadReady()
+    // ------------- Scoring -------------
+    (int, float) Score(float[] z)
     {
-        return HeadLooksUsable(head);
+        if (head == null) return (-1, float.NegativeInfinity);
+        if (head.type == "centroid" && head.centroids != null) { L2NormalizeInPlace(z); return ScoreCentroidLocal(head, z); }
+        if (head.type == "linear" && head.W != null) return ScoreLinearLocal(head, z);
+        return (-1, float.NegativeInfinity);
     }
 
-    // ------------------- Helpers -------------------
-
-    private bool HeadLooksUsable(HeadData h)
+    static (int, float) ScoreCentroidLocal(HeadData h, float[] zNorm)
     {
-        if (h == null || h.classes == null || h.classes.Length == 0) return false;
-        if (h.type == "centroid")
-            return h.centroids != null && h.centroids.Length == h.classes.Length && h.centroids[0] != null && h.centroids[0].Length > 0;
-        if (h.type == "linear")
-            return h.W != null && h.W.GetLength(1) == h.classes.Length && h.W.GetLength(0) > 0;
+        int best = -1; float bestScore = float.NegativeInfinity;
+        var cents = h.centroids; if (cents == null) return (best, bestScore);
+        for (int c = 0; c < cents.Length; c++)
+        {
+            var cvec = cents[c]; if (cvec == null) continue;
+            float s = Dot(zNorm, cvec);
+            if (s > bestScore) { bestScore = s; best = c; }
+        }
+        return (best, bestScore);
+    }
+
+    static (int, float) ScoreLinearLocal(HeadData h, float[] z)
+    {
+        var W = h.W; if (W == null || z == null) return (-1, float.NegativeInfinity);
+        int D = W.GetLength(0), C = W.GetLength(1), dim = Math.Min(D, z.Length);
+        int best = -1; float bestScore = float.NegativeInfinity;
+        for (int c = 0; c < C; c++)
+        {
+            double s = 0.0;
+            for (int i = 0; i < dim; i++) s += (double)W[i, c] * z[i];
+            float sf = (float)s;
+            if (sf > bestScore) { bestScore = sf; best = c; }
+        }
+        return (best, bestScore);
+    }
+
+    static void L2NormalizeInPlace(float[] v)
+    {
+        if (v == null || v.Length == 0) return;
+        double sumSq = 0.0; for (int i = 0; i < v.Length; i++) sumSq += (double)v[i] * v[i];
+        double inv = sumSq > 1e-12 ? 1.0 / Math.Sqrt(sumSq) : 0.0;
+        for (int i = 0; i < v.Length; i++) v[i] = (float)(v[i] * inv);
+    }
+    static float Dot(float[] a, float[] b) { int n = Math.Min(a?.Length ?? 0, b?.Length ?? 0); double s = 0.0; for (int i = 0; i < n; i++) s += (double)a[i] * (double)b[i]; return (float)s; }
+    static int MajorityIndex(Queue<int> q) { var m = new Dictionary<int,int>(); foreach (var v in q) { if (!m.ContainsKey(v)) m[v]=0; m[v]++; } int best=-1,bc=-1; foreach (var kv in m) if (kv.Value>bc){bc=kv.Value;best=kv.Key;} return best; }
+
+    // ------------- Head management & enforcement -------------
+
+    public bool IsHeadReady() => HeadLooksUsable(head);
+    static bool HeadLooksUsable(HeadData h)
+    {
+        if (h == null) return false;
+        if (h.classes == null || h.classes.Length == 0) return false;
+        if (h.type == "centroid") return h.centroids != null && h.centroids.Length == h.classes.Length;
+        if (h.type == "linear")   return h.W != null && h.W.GetLength(1) == h.classes.Length;
         return false;
     }
 
-    private static string Majority(IEnumerable<string> labels)
+    // Lock/unlock desired head
+    public void SetPreferredHead(string name, bool enforce = true)
     {
-        string best = null; int bestCount = -1;
-        var map = new Dictionary<string, int>();
-        foreach (var l in labels)
-        {
-            if (string.IsNullOrEmpty(l)) continue;
-            map.TryGetValue(l, out var c); c++; map[l] = c;
-            if (c > bestCount) { bestCount = c; best = l; }
-        }
-        return best ?? "";
+        PreferredHeadName = name ?? "";
+        EnforcePreferredHead = enforce;
+        DLog($"[LC] PreferredHead set to '{PreferredHeadName}', enforce={EnforcePreferredHead}");
     }
+    public void ClearPreferredHead() => SetPreferredHead("", false);
+
+    public void SetHead(HeadData h) => SetHead(h, CurrentHeadName, force:false);
+
+    public void SetHead(HeadData h, string displayName, bool force = false)
+    {
+        // Enforce preferred head name unless forced
+        if (EnforcePreferredHead && !force)
+        {
+            var nameToApply = displayName ?? "";
+            if (!string.IsNullOrEmpty(PreferredHeadName) &&
+                !string.Equals(nameToApply, PreferredHeadName, StringComparison.Ordinal))
+            {
+                DWarn($"[LC] SetHead ignored (enforced='{PreferredHeadName}', attempted='{nameToApply}')");
+                return;
+            }
+        }
+
+        if (!HeadLooksUsable(h)) { DWarn("[LC] SetHead skipped: head null/invalid."); return; }
+
+        head = h;
+        CurrentHeadName = displayName ?? CurrentHeadName;
+
+        if (head.type == "centroid" && head.centroids != null)
+            for (int c = 0; c < head.centroids.Length; c++)
+                if (head.centroids[c] != null) L2NormalizeInPlace(head.centroids[c]);
+
+        LastLabel = ""; LastScore = 0f; smoothQ.Clear();
+        OnPrediction?.Invoke("", 0f);
+        OnHeadChanged?.Invoke(head);
+
+        int clsCount = (head.classes != null) ? head.classes.Length : 0;
+        int dim = -1;
+        if (head.type == "centroid") dim = (head.centroids != null && head.centroids.Length > 0 && head.centroids[0] != null) ? head.centroids[0].Length : -1;
+        else if (head.type == "linear" && head.W != null) dim = head.W.GetLength(0);
+
+        DLog($"[LC] Head set: name='{CurrentHeadName}', type={head.type}, dim={dim}, classes={clsCount}, classes=[{ClassesPreview(head)}]");
+    }
+
+    public void LoadHeadFromPath(string path, bool force = false)
+    {
+        if (!File.Exists(path)) { DErr("[LC] Head file missing: " + path); return; }
+        try
+        {
+            var json = File.ReadAllText(path);
+            var h = JsonUtility.FromJson<HeadData>(json);
+            var display = Path.GetFileNameWithoutExtension(path);
+            SetHead(h, display, force);
+            DLog($"[LC] Loaded head from path: '{path}', name='{CurrentHeadName}' (force={force})");
+        }
+        catch (Exception e) { DErr("[LC] LoadHeadFromPath error: " + e.Message); }
+    }
+
+    public void Clear()
+    {
+        head = null; CurrentHeadName = ""; LastLabel = ""; LastScore = 0f; smoothQ.Clear();
+        OnPrediction?.Invoke("", 0f); OnHeadChanged?.Invoke(null);
+        DLog("[LC] Cleared head and predictions.");
+    }
+
+    public void StartClassifying() => SetRunning(true);
+    public void StopClassifying()  => SetRunning(false);
+    public void SetRunning(bool run) { IsRunning = run; DLog($"[LC] SetRunning({run})"); }
+
+    public void ResetPrediction() { LastLabel = ""; LastScore = 0f; OnPrediction?.Invoke("", 0f); }
+
+    // ------------- Logging helpers -------------
+    void Skip(string reason)
+    {
+        if (consoleDebug && reason != _lastSkipPrinted)
+        {
+            Debug.Log($"[LC] Skip: {reason} (headReady={IsHeadReady()}, embedder={(embedder!=null)}, srcTex={(sourceTexture!=null)})");
+            _lastSkipPrinted = reason;
+        }
+    }
+    void DLog(string msg)  { if (consoleDebug) Debug.Log(msg); }
+    void DWarn(string msg) { if (consoleDebug) Debug.LogWarning(msg); }
+    void DErr(string msg)  { Debug.LogError(msg); }
+
+    static string ClassesPreview(HeadData h) => (h == null || h.classes == null) ? "(null)" : string.Join(", ", h.classes);
 }

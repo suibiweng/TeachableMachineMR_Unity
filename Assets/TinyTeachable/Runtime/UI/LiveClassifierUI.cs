@@ -1,5 +1,8 @@
+// Assets/TinyTeachable/Runtime/UI/LiveClassifierUI.cs
+using System;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Collections.Generic;
 using UnityEngine;
 using TMPro;
@@ -9,46 +12,28 @@ using UnityEngine.UI;
 public class LiveClassifierUI : MonoBehaviour
 {
     [Header("Links")]
-    public LiveClassifier classifier;           // drag your LiveClassifier
-    public SentisEmbedder embedder;             // optional; shows model name
-    public DetectionManager detectionManager;   // drag your DetectionManager
+    public LiveClassifier classifier;          // assign
+    public DetectionManager detectionManager;  // optional (not used to switch here)
+    public SentisEmbedder embedder;            // optional
 
     [Header("UI (TMP)")]
     public TMP_Text labelText;
     public TMP_Text scoreText;
-    public TMP_Text modelText;
     public TMP_Text headText;
     public TMP_Text fpsText;
 
-    [Header("Detections (this dropdown controls switching)")]
-    public TMP_Dropdown detectionDropdown;   // THIS controls switching heads
-    public Button refreshDetectionsButton;   // optional
+    [Header("Saved Detections UI")]
+    public TMP_Dropdown detectionDropdown;
+    public Button refreshDetectionsButton;
 
-    [Header("Playback Controls (optional)")]
-    public Button playButton;                // optional
-    public Button stopButton;                // optional
-    public TMP_Text runStateText;            // optional "Running / Stopped"
+    [Header("Prefs")]
+    public string lastHeadPlayerPrefKey = "TTM_LastHead";
 
-    [Header("Behavior")]
-    [Tooltip("Switch immediately when dropdown changes.")]
-    public bool applyOnDropdownChange = true;
-    [Tooltip("Auto-start the classifier after switching heads.")]
-    public bool autoRunAfterSwitch = true;
-    public string scoreFormat = "0.00";
+    public string scoreFormat = "0.000";
 
-    // cache
-    private string _lastShownLabel = "";
-    private float  _lastShownScore = -1f;
+    private string _lastLabel = "";
+    private float  _lastScore = -1f;
     private float  _fpsSmoothed = 0f;
-
-    private List<DetectionManager.DetectionInfo> _cachedDetections = new();
-    private string _requestedHeadName = "";     // what the user picked
-    private bool   _awaitingFirstPred = false;  // after switch, until we see a new pred
-
-    void Awake()
-    {
-        if (!classifier) classifier = GetComponent<LiveClassifier>();
-    }
 
     void OnEnable()
     {
@@ -57,20 +42,13 @@ public class LiveClassifierUI : MonoBehaviour
             classifier.OnPrediction  += HandlePrediction;
             classifier.OnHeadChanged += HandleHeadChanged;
         }
-
         if (detectionDropdown) detectionDropdown.onValueChanged.AddListener(OnSelectDetectionIndex);
         if (refreshDetectionsButton) refreshDetectionsButton.onClick.AddListener(OnRefreshDetectionsClicked);
 
-        if (playButton) playButton.onClick.AddListener(OnPlayClicked);
-        if (stopButton) stopButton.onClick.AddListener(OnStopClicked);
-
-        // initial UI
         PushTexts(classifier ? classifier.LastLabel : "", classifier ? classifier.LastScore : 0f, force:true);
-        if (modelText && embedder) modelText.text = $"Model: {SafeModelName(embedder)}";
-        WriteHeadText(SafeHeadName());
-        RefreshDetectionsList(selectCurrent:true);
+        if (headText) headText.text = $"Head: {(classifier ? classifier.CurrentHeadName : "")}";
 
-        UpdateRunUI();
+        RefreshDetectionsList(selectCurrent:true);
     }
 
     void OnDisable()
@@ -80,11 +58,8 @@ public class LiveClassifierUI : MonoBehaviour
             classifier.OnPrediction  -= HandlePrediction;
             classifier.OnHeadChanged -= HandleHeadChanged;
         }
-
         if (detectionDropdown) detectionDropdown.onValueChanged.RemoveListener(OnSelectDetectionIndex);
         if (refreshDetectionsButton) refreshDetectionsButton.onClick.RemoveListener(OnRefreshDetectionsClicked);
-        if (playButton) playButton.onClick.RemoveListener(OnPlayClicked);
-        if (stopButton) stopButton.onClick.RemoveListener(OnStopClicked);
     }
 
     void Update()
@@ -95,264 +70,129 @@ public class LiveClassifierUI : MonoBehaviour
             _fpsSmoothed = (_fpsSmoothed <= 0f) ? fps : Mathf.Lerp(_fpsSmoothed, fps, 0.15f);
             fpsText.text = $"FPS: {Mathf.RoundToInt(_fpsSmoothed)}";
         }
-
-        if (modelText && embedder) modelText.text = $"Model: {SafeModelName(embedder)}";
-
-        // IMPORTANT: do NOT overwrite head text every frame from classifier if it's empty.
-        // We only write head text in explicit places (switch/event).
+        if (headText && classifier) headText.text = $"Head: {classifier.CurrentHeadName}";
     }
 
-    // ---------- Populate + switch ----------
-
+    // ------------ Populate dropdown ------------
     public void RefreshDetectionsList(bool selectCurrent = false)
     {
-        if (detectionDropdown == null || detectionManager == null) return;
+        if (detectionDropdown == null) return;
 
-        _cachedDetections = detectionManager.ListDetections();
-        var labels = _cachedDetections.Select(d => d.name).ToList();
+        var labels = new List<string>();
+        var dir = Path.Combine(Application.persistentDataPath, "heads");
+        if (Directory.Exists(dir))
+        {
+            foreach (var f in Directory.GetFiles(dir, "*.json"))
+                labels.Add(Path.GetFileNameWithoutExtension(f));
+        }
 
         detectionDropdown.ClearOptions();
         detectionDropdown.AddOptions(labels);
         detectionDropdown.RefreshShownValue();
 
-        if (selectCurrent)
+        if (selectCurrent && classifier != null && !string.IsNullOrEmpty(classifier.CurrentHeadName))
         {
-            var current = SafeHeadName();
-            int idx = labels.FindIndex(s => s == current);
-            if (idx >= 0)
-            {
-                detectionDropdown.SetValueWithoutNotify(idx);
-                detectionDropdown.RefreshShownValue();
-            }
+            int idx = labels.FindIndex(s => s == classifier.CurrentHeadName);
+            if (idx >= 0) { detectionDropdown.SetValueWithoutNotify(idx); detectionDropdown.RefreshShownValue(); }
         }
+        Debug.Log($"[LiveClassifierUI] Dropdown list: [{string.Join(", ", labels)}]");
     }
 
     private void OnRefreshDetectionsClicked()
     {
         RefreshDetectionsList(selectCurrent: true);
+        Debug.Log("[LiveClassifierUI] Refreshed detection list.");
     }
 
+    // ------------ Switch (authoritative) ------------
     private void OnSelectDetectionIndex(int idx)
     {
-        if (!applyOnDropdownChange) return;
-        if (detectionManager == null || _cachedDetections == null) return;
-        if (idx < 0 || idx >= _cachedDetections.Count) return;
+        if (classifier == null || detectionDropdown == null) return;
 
-        var name = _cachedDetections[idx].name;
-        _requestedHeadName = name;
+        var options = detectionDropdown.options.Select(o => o.text).ToList();
+        if (idx < 0 || idx >= options.Count) return;
 
-        // 1) Manager/trainer path (keeps session in sync)
-        detectionManager.SetDetection(name);
+        var name = options[idx];
+        var path = Path.Combine(Application.persistentDataPath, "heads", name + ".json");
 
-        // 2) Guaranteed live swap: load head directly
-        ApplyHeadDirect(name);
+        Debug.Log($"[LiveClassifierUI] Authoritative switch -> '{name}'");
 
-        // 3) Try to force-set the head name on the classifier if it didn't set it
-        TryForceSetClassifierHeadName(name);
+        // Clear UI immediately
+        ForceClearLabelAndScore();
+        classifier.ResetPrediction();
 
-        // 4) Clear stale UI label/score & show the intended head name immediately
-        ClearPredictionUI();
-        WriteHeadText(name);
-        _awaitingFirstPred = true;
+        // NEW: lock to this head name so any outside SetHead attempts with other names are ignored
+        classifier.SetPreferredHead(name, enforce: true);
 
-        // 5) Ensure the classifier is running so we get fresh predictions
-        if (autoRunAfterSwitch) TrySetRunning(true);
-        UpdateRunUI();
-
-        Debug.Log($"[LiveClassifierUI] Switch requested → '{name}'.");
-    }
-
-    // ---------- Play / Stop ----------
-
-    private void OnPlayClicked()
-    {
-        TrySetRunning(true);
-        UpdateRunUI();
-    }
-
-    private void OnStopClicked()
-    {
-        TrySetRunning(false);
-        UpdateRunUI();
-    }
-
-    private void UpdateRunUI()
-    {
-        bool isRunning = TryGetIsRunning();
-        if (runStateText) runStateText.text = isRunning ? "Running" : "Stopped";
-        if (playButton) playButton.interactable = !isRunning;
-        if (stopButton) stopButton.interactable = isRunning;
-    }
-
-    private void TrySetRunning(bool run)
-    {
-        if (!classifier) return;
-        var t = classifier.GetType();
-
-        var setRunning = t.GetMethod("SetRunning", new[] { typeof(bool) });
-        if (setRunning != null) { setRunning.Invoke(classifier, new object[] { run }); return; }
-
-        if (run)
+        if (!File.Exists(path))
         {
-            var startM = t.GetMethod("StartClassifying", System.Type.EmptyTypes);
-            if (startM != null) { startM.Invoke(classifier, null); return; }
-        }
-        else
-        {
-            var stopM = t.GetMethod("StopClassifying", System.Type.EmptyTypes);
-            if (stopM != null) { stopM.Invoke(classifier, null); return; }
+            Debug.LogWarning($"[LiveClassifierUI] Missing head file: {path}");
+            return;
         }
 
-        classifier.enabled = run; // fallback
+        // Apply directly (respects enforcement; name matches PreferredHeadName so accepted)
+        classifier.LoadHeadFromPath(path, force:false);
+
+        // Persist user choice for autoloaders
+        PlayerPrefs.SetString(lastHeadPlayerPrefKey, name);
+
+        if (headText) headText.text = $"Head: {name}";
     }
 
-    private bool TryGetIsRunning()
-    {
-        if (!classifier) return false;
-        var t = classifier.GetType();
-
-        var prop = t.GetProperty("IsRunning");
-        if (prop != null && prop.PropertyType == typeof(bool))
-            return (bool)prop.GetValue(classifier);
-
-        var field = t.GetField("IsRunning");
-        if (field != null && field.FieldType == typeof(bool))
-            return (bool)field.GetValue(classifier);
-
-        return classifier.enabled;
-    }
-
-    // ---------- Classifier events ----------
-
+    // ------------ Events ------------
     private void HandlePrediction(string label, float score)
     {
-        // first fresh prediction after switch—now we can trust classifier state
-        if (_awaitingFirstPred)
-        {
-            // If classifier exposes a non-empty name now, use it; otherwise keep requested
-            var resolved = SafeHeadName();
-            if (!string.IsNullOrEmpty(resolved)) WriteHeadText(resolved);
-            _awaitingFirstPred = false;
-        }
-
         PushTexts(label, score);
+        int embLen = TryGetEmbeddingLength(embedder);
+        Debug.Log($"[Pred] head='{(classifier? classifier.CurrentHeadName : "")}' label='{label}' score={score.ToString(scoreFormat)} embLen={embLen}");
     }
 
     private void HandleHeadChanged(HeadData head)
     {
-        // Prefer classifier.CurrentHeadName if non-empty, otherwise keep our requested name
-        var resolved = SafeHeadName();
-        if (string.IsNullOrEmpty(resolved)) resolved = _requestedHeadName;
-        WriteHeadText(resolved);
+        if (headText && classifier) headText.text = $"Head: {classifier.CurrentHeadName}";
 
-        // keep dropdown selection in sync if the head changed elsewhere
-        if (detectionDropdown && !string.IsNullOrEmpty(resolved))
+        // Align the dropdown to the actual head
+        if (detectionDropdown && classifier != null && !string.IsNullOrEmpty(classifier.CurrentHeadName))
         {
-            var options = detectionDropdown.options.Select(o => o.text).ToList();
-            int idx = options.FindIndex(s => s == resolved);
-            if (idx >= 0)
-            {
-                detectionDropdown.SetValueWithoutNotify(idx);
-                detectionDropdown.RefreshShownValue();
-            }
+            var opts = detectionDropdown.options.Select(o => o.text).ToList();
+            int i = opts.FindIndex(s => s == classifier.CurrentHeadName);
+            if (i >= 0) { detectionDropdown.SetValueWithoutNotify(i); detectionDropdown.RefreshShownValue(); }
         }
 
-        // reset UI until first new prediction
-        ClearPredictionUI();
-        _awaitingFirstPred = true;
+        // Clear once to ensure no stale label remains
+        ForceClearLabelAndScore();
+        Debug.Log($"[LiveClassifierUI] Head changed → '{(classifier ? classifier.CurrentHeadName : "(null)")}', enforce={classifier.EnforcePreferredHead}, preferred='{classifier.PreferredHeadName}'");
     }
 
-    // ---------- Helpers ----------
-
+    // ------------ UI helpers ------------
     private void PushTexts(string label, float score, bool force = false)
     {
-        if (labelText && (force || label != _lastShownLabel))
+        if (labelText && (force || label != _lastLabel))
             labelText.text = string.IsNullOrEmpty(label) ? "Label: —" : $"Label: {label}";
-
-        if (scoreText && (force || !Mathf.Approximately(score, _lastShownScore)))
+        if (scoreText && (force || !Mathf.Approximately(score, _lastScore)))
             scoreText.text = $"Score: {score.ToString(scoreFormat)}";
-
-        _lastShownLabel = label;
-        _lastShownScore = score;
+        _lastLabel = label; _lastScore = score;
     }
 
-    private void ClearPredictionUI()
+    private void ForceClearLabelAndScore()
     {
-        _lastShownLabel = "";
-        _lastShownScore = -1f;
+        _lastLabel = ""; _lastScore = 0f;
         if (labelText) labelText.text = "Label: —";
         if (scoreText) scoreText.text = $"Score: {0f.ToString(scoreFormat)}";
+        Debug.Log("[LiveClassifierUI] Cleared label/score.");
     }
 
-    private static string SafeModelName(SentisEmbedder e)
+    private int TryGetEmbeddingLength(SentisEmbedder e)
     {
-        try { return (e != null && e.modelAsset != null) ? e.modelAsset.name : "(no model)"; }
-        catch { return "(no model)"; }
-    }
-
-    private string SafeHeadName()
-    {
-        if (!classifier) return "";
-        // Try property
-        var t = classifier.GetType();
-        var prop = t.GetProperty("CurrentHeadName");
-        if (prop != null && prop.PropertyType == typeof(string))
+        if (!e) return 0;
+        var t = e.GetType();
+        foreach (var pname in new[] { "LastEmbedding", "LatestEmbedding", "lastEmbedding", "Embedding", "embedding" })
         {
-            string v = (string)prop.GetValue(classifier);
-            return v ?? "";
+            var p = t.GetProperty(pname, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (p != null) { var arr = p.GetValue(e) as float[]; if (arr != null) return arr.Length; }
+            var f = t.GetField(pname, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (f != null) { var arr = f.GetValue(e) as float[]; if (arr != null) return arr.Length; }
         }
-        // Try field
-        var field = t.GetField("CurrentHeadName");
-        if (field != null && field.FieldType == typeof(string))
-        {
-            string v = (string)field.GetValue(classifier);
-            return v ?? "";
-        }
-        return "";
-    }
-
-    private void TryForceSetClassifierHeadName(string name)
-    {
-        if (!classifier || string.IsNullOrEmpty(name)) return;
-        var t = classifier.GetType();
-
-        // Only set if classifier currently reports empty; we don’t want to fight its own state.
-        var current = SafeHeadName();
-        if (!string.IsNullOrEmpty(current)) return;
-
-        var prop = t.GetProperty("CurrentHeadName");
-        if (prop != null && prop.CanWrite && prop.PropertyType == typeof(string))
-        {
-            prop.SetValue(classifier, name);
-            return;
-        }
-        var field = t.GetField("CurrentHeadName");
-        if (field != null && field.FieldType == typeof(string))
-        {
-            field.SetValue(classifier, name);
-        }
-    }
-
-    private void WriteHeadText(string nameOrEmpty)
-    {
-        if (!headText) return;
-        headText.text = string.IsNullOrEmpty(nameOrEmpty) ? "Head: —" : $"Head: {nameOrEmpty}";
-    }
-
-    private void ApplyHeadDirect(string name)
-    {
-        if (!classifier || string.IsNullOrEmpty(name)) return;
-        var path = Path.Combine(Application.persistentDataPath, "heads", name + ".json");
-        if (File.Exists(path))
-        {
-            // Call LoadHeadFromPath if it exists
-            var t = classifier.GetType();
-            var m = t.GetMethod("LoadHeadFromPath", new[] { typeof(string) });
-            if (m != null) m.Invoke(classifier, new object[] { path });
-        }
-        else
-        {
-            Debug.LogWarning($"[LiveClassifierUI] Head file not found: {path}");
-        }
+        return 0;
     }
 }
