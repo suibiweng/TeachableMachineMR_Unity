@@ -1,3 +1,4 @@
+// Assets/TinyTeachable/Runtime/UI/DetectionManagerUI.cs
 using System.IO;
 using System.Linq;
 using System.Collections.Generic;
@@ -14,7 +15,7 @@ public class DetectionManagerUI : MonoBehaviour
     public LiveClassifier classifier;           // optional (used for direct-apply fallback)
 
     // =======================
-    // Panels (assign GameObjects)
+    // Panels
     // =======================
     [Header("Panels")]
     public GameObject panelManager;   // Manager interface (dropdown + retrain/remove + create row)
@@ -85,11 +86,11 @@ public class DetectionManagerUI : MonoBehaviour
         if (detectionSwitchDropdown)  detectionSwitchDropdown.onValueChanged.AddListener(OnSwitchDetectionIndex);
 
         // Classes
-        if (addClassButton)           addClassButton.onClick.AddListener(OnAddClass);
-        if (removeSelectedClassButton)removeSelectedClassButton.onClick.AddListener(OnRemoveSelectedClass);
-        if (renameClassButton)        renameClassButton.onClick.AddListener(OnRenameSelectedClass);
-        if (addSampleButton)          addSampleButton.onClick.AddListener(OnAddSample);
-        if (classDropdown)            classDropdown.onValueChanged.AddListener(OnSelectClassIndex);
+        if (addClassButton)            addClassButton.onClick.AddListener(OnAddClass);
+        if (removeSelectedClassButton) removeSelectedClassButton.onClick.AddListener(OnRemoveSelectedClass);
+        if (renameClassButton)         renameClassButton.onClick.AddListener(OnRenameSelectedClass);
+        if (addSampleButton)           addSampleButton.onClick.AddListener(OnAddSample);
+        if (classDropdown)             classDropdown.onValueChanged.AddListener(OnSelectClassIndex);
 
         // Train
         if (trainButton)              trainButton.onClick.AddListener(OnTrain);
@@ -114,8 +115,8 @@ public class DetectionManagerUI : MonoBehaviour
 
     void Update()
     {
-        // OVR-only shortcut: B button (OVRInput.Button.Two) adds a sample when on Classes panel
-        // Requires Oculus Integration package.
+#if OVR_SUPPORTED
+        // Optional: OVR shortcut demo
         if (panelClasses != null && panelClasses.activeInHierarchy)
         {
             if (OVRInput.GetDown(OVRInput.Button.Two)) // B on Touch/Touch Pro
@@ -123,6 +124,7 @@ public class DetectionManagerUI : MonoBehaviour
                 OnAddSample();
             }
         }
+#endif
     }
 
     // =======================
@@ -222,105 +224,7 @@ public class DetectionManagerUI : MonoBehaviour
         RefreshClassDropdown(selectLast: false);
         ShowPanels(PanelSet.ClassesAndTrain);
         UpdateStatus($"Created '{name}'.");
-        UpdateMessage($"Created <b>{name}</b>. Add classes, then collect samples.");
-    }
-
-    // =======================
-    // Classes actions
-    // =======================
-    public void OnAddClass()
-    {
-        if (!trainer) { UpdateStatus("Trainer missing."); return; }
-        var name = SafeText(newClassInput, "");
-        if (string.IsNullOrWhiteSpace(name)) { UpdateMessage("Enter a class name."); return; }
-
-        trainer.AddClass(name);
-        newClassInput.SetTextWithoutNotify(string.Empty);
-        RefreshClassDropdown(selectLast: true);
-
-        // start local count at 0 for this class
-        _localSampleCounts[name] = 0;
-
-        UpdateStatus($"Added class '{name}'.");
-        UpdateMessage($"Class <b>{name}</b> added. Samples: 0");
-    }
-
-    public void OnRemoveSelectedClass()
-    {
-        if (!trainer) { UpdateStatus("Trainer missing."); return; }
-        if (trainer.Classes.Count == 0) { UpdateMessage("No classes to remove."); return; }
-
-        int idx = GetSelectedClassIndex();
-        if (idx < 0 || idx >= trainer.Classes.Count) { UpdateMessage("No class selected."); return; }
-
-        var removed = trainer.Classes[idx];
-        var newList = trainer.Classes.Where((c, i) => i != idx).ToList();
-        trainer.ResetAll(newList.ToArray()); // NOTE: clears samples
-        RefreshClassDropdown();
-
-        // drop from local counts
-        _localSampleCounts.Remove(removed);
-
-        UpdateStatus($"Removed class '{removed}'.");
-        UpdateMessage($"Removed class <b>{removed}</b>. (Samples for that class cleared)");
-    }
-
-    public void OnRenameSelectedClass()
-    {
-        if (!trainer) { UpdateStatus("Trainer missing."); return; }
-        if (trainer.Classes.Count == 0) { UpdateMessage("No classes to rename."); return; }
-
-        int idx = GetSelectedClassIndex();
-        if (idx < 0 || idx >= trainer.Classes.Count) { UpdateMessage("No class selected."); return; }
-
-        var newName = SafeText(renameClassInput, "");
-        if (string.IsNullOrWhiteSpace(newName)) { UpdateMessage("Enter a new class name."); return; }
-
-        var list = new List<string>(trainer.Classes);
-        string oldName = list[idx];
-        list[idx] = newName;
-
-        trainer.ResetAll(list.ToArray()); // NOTE: rebuild (samples cleared for renamed class)
-        RefreshClassDropdown();
-        if (classDropdown) { classDropdown.value = idx; classDropdown.RefreshShownValue(); }
-
-        // move local count (but reset to 0 since trainer samples were cleared)
-        _localSampleCounts.Remove(oldName);
-        _localSampleCounts[newName] = 0;
-
-        UpdateStatus($"Renamed '{oldName}' → '{newName}'.");
-        UpdateMessage($"Renamed to <b>{newName}</b>. Samples: 0 (renaming resets samples)");
-    }
-
-    public void OnSelectClassIndex(int idx)
-    {
-        if (!trainer) return;
-        trainer.SelectClass(idx);
-        int shown = GetDisplayedCount(idx);
-        UpdateMessage($"Selected class: <b>{GetSelectedClassLabel()}</b>. Samples: {shown}");
-    }
-
-    public void OnAddSample()
-    {
-        if (!trainer) { UpdateMessage("Trainer missing."); return; }
-        if (trainer.Classes.Count == 0) { UpdateMessage("No classes yet."); return; }
-
-        int idx = GetSelectedClassIndex();
-        if (idx < 0 || idx >= trainer.Classes.Count) { UpdateMessage("Select a class first."); return; }
-
-        string label = trainer.Classes[idx];
-
-        // Immediately bump local shadow so UI reflects the add right away
-        BumpLocalCount(label);
-
-        // Then ask trainer to capture the sample
-        trainer.AddSampleFromCurrent();
-
-        // Show whichever is higher (trainer may still say 0 on this frame)
-        int shown = GetDisplayedCount(idx);
-
-        UpdateStatus($"Sample added → '{label}'");
-        UpdateMessage($"Added sample to <b>{label}</b>. Total samples: <b>{shown}</b>");
+        UpdateMessage($"Created <b>{name}</b>. Add classes, then collect samples, then Train.");
     }
 
     // =======================
@@ -334,7 +238,7 @@ public class DetectionManagerUI : MonoBehaviour
             Application.persistentDataPath, "heads",
             (trainer.saveHeadName ?? "").Trim());
 
-        detectionManager.TrainDetection();
+        detectionManager.TrainDetection(); // applies via trainer
 
         if (autoRefreshAfterTrain)
             StartCoroutine(CoRefreshAfterTrain(expectedFile));
@@ -441,14 +345,39 @@ public class DetectionManagerUI : MonoBehaviour
         }
     }
 
-    // ---- Direct apply fallback (ensures LiveClassifier actually swaps) ----
+    void ResetLocalCountsFromTrainer()
+    {
+        _localSampleCounts.Clear();
+        if (trainer != null && trainer.Classes != null)
+            foreach (var c in trainer.Classes) _localSampleCounts[c] = 0;
+    }
+
+    void SyncLocalCountsWith(List<string> labels)
+    {
+        foreach (var l in labels) if (!_localSampleCounts.ContainsKey(l)) _localSampleCounts[l] = 0;
+        // prune removed
+        var toRemove = _localSampleCounts.Keys.Where(k => !labels.Contains(k)).ToList();
+        foreach (var k in toRemove) _localSampleCounts.Remove(k);
+    }
+
+    // ---- Direct apply fallback (now authoritative + forced) ----
     void ApplyHeadDirect(string name)
     {
         if (classifier == null || string.IsNullOrEmpty(name)) return;
+
         var path = Path.Combine(Application.persistentDataPath, "heads", name + ".json");
         if (File.Exists(path))
         {
-            classifier.LoadHeadFromPath(path);
+            // Lock preference so the apply is accepted even if enforcement is on
+            classifier.SetPreferredHead(name, enforce: true);
+
+            // >>> FORCE the swap so nothing can block it
+            classifier.LoadHeadFromPath(path, force:true);
+
+            // Persist for autoloader harmony
+            PlayerPrefs.SetString("TTM_LastHead", name);
+            PlayerPrefs.Save();
+
             UpdateStatus($"[DirectApply] Head applied: {name}");
         }
         else
@@ -505,9 +434,45 @@ public class DetectionManagerUI : MonoBehaviour
         UpdateMessage("Training complete. List refreshed.");
     }
 
-    // =======================
-    // Sample count helpers (robust + instant UI)
-    // =======================
+    // ======= Simple class editing & sampling stubs (optional) =======
+    void OnAddClass()
+    {
+        if (!trainer) { UpdateStatus("Trainer missing."); return; }
+        var label = SafeText(newClassInput, "").Trim();
+        if (string.IsNullOrEmpty(label)) { UpdateMessage("Enter a class name first."); return; }
+        trainer.AddClass(label);
+        RefreshClassDropdown(selectLast:true);
+        UpdateMessage($"Added class <b>{label}</b>.");
+    }
+
+    void OnRemoveSelectedClass()
+    {
+        if (!trainer) { UpdateStatus("Trainer missing."); return; }
+        int i = GetSelectedClassIndex();
+        // trainer should expose a remove—if not, skip here or implement
+        UpdateMessage("Remove class not implemented in this minimal UI.");
+    }
+
+    void OnRenameSelectedClass()
+    {
+        if (!trainer) { UpdateStatus("Trainer missing."); return; }
+        UpdateMessage("Rename class not implemented in this minimal UI.");
+    }
+
+    void OnSelectClassIndex(int i)
+    {
+        trainer?.SelectClass(i);
+    }
+
+    void OnAddSample()
+    {
+        if (!trainer) { UpdateStatus("Trainer missing."); return; }
+        trainer.AddSampleFromCurrent();
+        var label = GetSelectedClassLabel();
+        _localSampleCounts[label] = GetLocalCount(label) + 1;
+        UpdateMessage($"Added sample to <b>{label}</b> (UI total: {GetLocalCount(label)}).");
+    }
+
     int GetLocalCount(string label)
     {
         if (!_localSampleCounts.TryGetValue(label, out var c))
@@ -516,82 +481,5 @@ public class DetectionManagerUI : MonoBehaviour
             _localSampleCounts[label] = 0;
         }
         return c;
-    }
-
-    void BumpLocalCount(string label)
-    {
-        _localSampleCounts[label] = GetLocalCount(label) + 1;
-    }
-
-    /// Returns the number we should show in UI:
-    /// - If trainer exposes a count, show max(trainer, local) so UI updates instantly
-    /// - Otherwise fallback to local
-    int GetDisplayedCount(int classIndex)
-    {
-        if (trainer == null || trainer.Classes == null || classIndex < 0 || classIndex >= trainer.Classes.Count)
-            return 0;
-
-        string label = trainer.Classes[classIndex];
-        int trainerCount = TryGetTrainerCount(classIndex);
-        int localCount   = GetLocalCount(label);
-
-        if (trainerCount >= 0) return Mathf.Max(trainerCount, localCount);
-        return localCount;
-    }
-
-    // Try to read sample counts from trainer; if unavailable, use -1
-    int TryGetTrainerCount(int classIndex)
-    {
-        // Look for common shapes:
-        // 1) public IReadOnlyList<int> SampleCounts { get; }
-        // 2) public int GetSampleCountFor(int i)
-        // 3) public int GetSampleCount(string className)
-        try
-        {
-            var prop = trainer.GetType().GetProperty("SampleCounts");
-            if (prop != null)
-            {
-                var val = prop.GetValue(trainer) as System.Collections.IList;
-                if (val != null && classIndex >= 0 && classIndex < val.Count)
-                    return (int)val[classIndex];
-            }
-
-            var m1 = trainer.GetType().GetMethod("GetSampleCountFor", new[] { typeof(int) });
-            if (m1 != null) return (int)m1.Invoke(trainer, new object[] { classIndex });
-
-            var m2 = trainer.GetType().GetMethod("GetSampleCount", new[] { typeof(string) });
-            if (m2 != null) return (int)m2.Invoke(trainer, new object[] { trainer.Classes[classIndex] });
-        }
-        catch { /* swallow & fallback */ }
-
-        return -1;
-    }
-
-    void ResetLocalCountsFromTrainer()
-    {
-        _localSampleCounts.Clear();
-        if (trainer == null || trainer.Classes == null) return;
-
-        for (int i = 0; i < trainer.Classes.Count; i++)
-        {
-            int count = TryGetTrainerCount(i);
-            _localSampleCounts[trainer.Classes[i]] = Mathf.Max(0, count);
-        }
-    }
-
-    void SyncLocalCountsWith(List<string> classes)
-    {
-        // Remove counts for missing classes, add zeros for new ones, keep local ≥ trainer
-        var toRemove = _localSampleCounts.Keys.Where(k => !classes.Contains(k)).ToList();
-        foreach (var k in toRemove) _localSampleCounts.Remove(k);
-
-        for (int i = 0; i < classes.Count; i++)
-        {
-            var c = classes[i];
-            if (!_localSampleCounts.ContainsKey(c)) _localSampleCounts[c] = 0;
-
-            int tCount = TryGetTrainerCount(i);
-            if (tCount > _localSampleCounts[c]) _localSampleCounts[c] = tCount; // keep local ≥ trainer
-        }
     }
 }

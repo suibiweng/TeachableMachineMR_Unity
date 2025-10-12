@@ -2,7 +2,6 @@
 using System;
 using System.IO;
 using System.Linq;
-using System.Reflection;
 using System.Collections.Generic;
 using UnityEngine;
 using TMPro;
@@ -121,7 +120,7 @@ public class LiveClassifierUI : MonoBehaviour
         ForceClearLabelAndScore();
         classifier.ResetPrediction();
 
-        // NEW: lock to this head name so any outside SetHead attempts with other names are ignored
+        // Lock to this head name so any SetHead with another name is ignored
         classifier.SetPreferredHead(name, enforce: true);
 
         if (!File.Exists(path))
@@ -130,11 +129,12 @@ public class LiveClassifierUI : MonoBehaviour
             return;
         }
 
-        // Apply directly (respects enforcement; name matches PreferredHeadName so accepted)
-        classifier.LoadHeadFromPath(path, force:false);
+        // >>> FORCE the swap so enforcement can't block it
+        classifier.LoadHeadFromPath(path, force:true);
 
         // Persist user choice for autoloaders
         PlayerPrefs.SetString(lastHeadPlayerPrefKey, name);
+        PlayerPrefs.Save();
 
         if (headText) headText.text = $"Head: {name}";
     }
@@ -155,44 +155,31 @@ public class LiveClassifierUI : MonoBehaviour
         if (detectionDropdown && classifier != null && !string.IsNullOrEmpty(classifier.CurrentHeadName))
         {
             var opts = detectionDropdown.options.Select(o => o.text).ToList();
-            int i = opts.FindIndex(s => s == classifier.CurrentHeadName);
-            if (i >= 0) { detectionDropdown.SetValueWithoutNotify(i); detectionDropdown.RefreshShownValue(); }
+            int idx = opts.FindIndex(s => s == classifier.CurrentHeadName);
+            if (idx >= 0) detectionDropdown.SetValueWithoutNotify(idx);
         }
-
-        // Clear once to ensure no stale label remains
-        ForceClearLabelAndScore();
-        Debug.Log($"[LiveClassifierUI] Head changed → '{(classifier ? classifier.CurrentHeadName : "(null)")}', enforce={classifier.EnforcePreferredHead}, preferred='{classifier.PreferredHeadName}'");
     }
 
     // ------------ UI helpers ------------
-    private void PushTexts(string label, float score, bool force = false)
+    void PushTexts(string label, float score, bool force = false)
     {
-        if (labelText && (force || label != _lastLabel))
-            labelText.text = string.IsNullOrEmpty(label) ? "Label: —" : $"Label: {label}";
-        if (scoreText && (force || !Mathf.Approximately(score, _lastScore)))
-            scoreText.text = $"Score: {score.ToString(scoreFormat)}";
+        if (!force && label == _lastLabel && Mathf.Approximately(score, _lastScore)) return;
         _lastLabel = label; _lastScore = score;
+        if (labelText) labelText.text = label ?? "";
+        if (scoreText) scoreText.text = score.ToString(scoreFormat);
     }
 
-    private void ForceClearLabelAndScore()
+    void ForceClearLabelAndScore()
     {
-        _lastLabel = ""; _lastScore = 0f;
-        if (labelText) labelText.text = "Label: —";
-        if (scoreText) scoreText.text = $"Score: {0f.ToString(scoreFormat)}";
-        Debug.Log("[LiveClassifierUI] Cleared label/score.");
+        _lastLabel = ""; _lastScore = -1f;
+        if (labelText) labelText.text = "";
+        if (scoreText) scoreText.text = "";
     }
 
-    private int TryGetEmbeddingLength(SentisEmbedder e)
+    // FIXED: use OutputDim (your SentisEmbedder exposes this) instead of LastEmbedding
+    static int TryGetEmbeddingLength(SentisEmbedder emb)
     {
-        if (!e) return 0;
-        var t = e.GetType();
-        foreach (var pname in new[] { "LastEmbedding", "LatestEmbedding", "lastEmbedding", "Embedding", "embedding" })
-        {
-            var p = t.GetProperty(pname, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-            if (p != null) { var arr = p.GetValue(e) as float[]; if (arr != null) return arr.Length; }
-            var f = t.GetField(pname, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-            if (f != null) { var arr = f.GetValue(e) as float[]; if (arr != null) return arr.Length; }
-        }
-        return 0;
+        try { return emb ? emb.OutputDim : -1; }
+        catch { return -1; }
     }
 }

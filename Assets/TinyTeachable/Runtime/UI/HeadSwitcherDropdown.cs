@@ -190,7 +190,7 @@ public class HeadSwitcherDropdown : MonoBehaviour
         else
         {
             // sync trainer classes for UI, then apply to classifier
-            if (head.classes != null) trainer.ResetAll(new List<string>(head.classes));
+            // if (head.classes != null) trainer.ResetAll(new List<string>(head.classes));
             classifier.SetHead(head);
             Debug.Log($"[HeadSwitcher] Loaded (trainer+classifier) -> {fileName}");
         }
