@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Text;                // <-- for UTF8 encoding
 using UnityEngine;
 using Unity.InferenceEngine; // Sentis ModelAsset
 
@@ -55,15 +56,15 @@ public class DynamicClassTrainer : MonoBehaviour
 
     // ---------------- Public API ----------------
 
+    // UPDATED: keep exactly what you pass in; no default placeholder class
     public void ResetAll(string[] classLabels)
     {
         Classes = new List<string>(classLabels ?? Array.Empty<string>());
-        if (Classes.Count == 0) {
-            Classes.Add("class_0");
-        }
-        currentClass = Mathf.Clamp(currentClass, 0, Classes.Count - 1);
 
-        if (embeddingDim > 0)
+        // reset selection safely
+        currentClass = 0;
+
+        if (embeddingDim > 0 && Classes.Count > 0)
         {
             trainer = new OnlineCentroidTrainer(Classes.Count, embeddingDim);
         }
@@ -108,6 +109,7 @@ public class DynamicClassTrainer : MonoBehaviour
         Debug.Log($"[Trainer] +1 sample to '{Classes[currentClass]}' (dim={z.Length}) count={trainer.GetCount(currentClass)}");
     }
 
+    // UPDATED: hardened saving + force-flush + precise logs + safe filename
     public void TrainAndSaveAndApply()
     {
         if (trainer == null || Classes == null || Classes.Count == 0)
@@ -132,19 +134,61 @@ public class DynamicClassTrainer : MonoBehaviour
 
         EnsureDefaultFilenames();
 
-        var dir = Path.Combine(PersistentPath, "heads");
-        Directory.CreateDirectory(dir);
-        var full = Path.Combine(dir, saveHeadName);
-        File.WriteAllText(full, JsonUtility.ToJson(head, true));
-        Debug.Log($"[Trainer] Head saved -> {full}");
+        // 1) Ensure non-empty, safe filename (.json ensured)
+        string safeFile = saveHeadName;
+        if (string.IsNullOrWhiteSpace(safeFile))
+            safeFile = (string.IsNullOrWhiteSpace(sessionName) ? "Session1" : sessionName) + ".json";
+        if (!safeFile.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
+            safeFile += ".json";
+        foreach (char c in Path.GetInvalidFileNameChars())
+            safeFile = safeFile.Replace(c, '_');
+        saveHeadName = safeFile; // keep state consistent
 
-        if (liveClassifier)
+        // 2) Build full path under persistentDataPath/heads
+        string dir = Path.Combine(PersistentPath, "heads");
+        string full = Path.Combine(dir, safeFile);
+
+        // 3) Serialize once
+        string headJson = JsonUtility.ToJson(head, prettyPrint: true);
+
+        // 4) Write with robust IO + logging
+        try
         {
-            var display = Path.GetFileNameWithoutExtension(saveHeadName);
-            liveClassifier.SetPreferredHead(display, enforce: true);
-            liveClassifier.SetHead(head, display, force: true);
+            Directory.CreateDirectory(dir);
+
+            using (var fs = new FileStream(full, FileMode.Create, FileAccess.Write, FileShare.Read))
+            using (var sw = new StreamWriter(fs, Encoding.UTF8))
+            {
+                sw.Write(headJson);
+                sw.Flush();
+                fs.Flush(true); // ensure data hits disk (Android/Quest-friendly)
+            }
+
+            long len = new FileInfo(full).Length;
+            Debug.Log($"[Trainer] Head saved -> {full}  (bytes={len})");
+        }
+        catch (Exception e)
+        {
+            Debug.LogError($"[Trainer] SAVE FAILED -> {full}\n{e}");
+            return; // bail out: nothing to apply
         }
 
+        // 5) Apply to live (no file polling needed)
+        if (liveClassifier)
+        {
+            var display = Path.GetFileNameWithoutExtension(safeFile);
+            try
+            {
+                liveClassifier.SetPreferredHead(display, enforce: true);
+                liveClassifier.SetHead(head, display, force: true);
+            }
+            catch (Exception e)
+            {
+                Debug.LogError("[Trainer] Applying head to LiveClassifier failed: " + e);
+            }
+        }
+
+        // 6) Fire event for UIs that are listening
         OnHeadTrained?.Invoke(saveHeadName, head);
     }
 

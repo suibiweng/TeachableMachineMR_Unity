@@ -11926,6 +11926,7 @@ GameObject:
   m_Component:
   - component: {fileID: 431030172}
   - component: {fileID: 431030171}
+  - component: {fileID: 431030173}
   m_Layer: 0
   m_Name: DetectionManagerMenu
   m_TagString: Untagged
@@ -11994,6 +11995,48 @@ Transform:
   - {fileID: 1586771814}
   m_Father: {fileID: 0}
   m_LocalEulerAnglesHint: {x: 25, y: -90, z: 0}
+--- !u!114 &431030173
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 431030170}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: f6adc8d00b7f2434a8367f1b01a5070a, type: 3}
+  m_Name: 
+  m_EditorClassIdentifier: 
+  detectionManager: {fileID: 0}
+  trainer: {fileID: 0}
+  classifier: {fileID: 0}
+  headName: Active
+  lastHeadPlayerPrefKey: TTM_LastHead
+  trainRefreshTimeoutSec: 3
+  detectionTag: 
+  version: 
+  notes: 
+  headNameInput: {fileID: 0}
+  tagInput: {fileID: 0}
+  versionInput: {fileID: 0}
+  notesInput: {fileID: 0}
+  applyNameAndMetaButton: {fileID: 0}
+  classDropdown: {fileID: 0}
+  newClassInput: {fileID: 0}
+  addClassButton: {fileID: 0}
+  addSampleButton: {fileID: 0}
+  existingClassesDropdown: {fileID: 0}
+  useExistingClassButton: {fileID: 0}
+  trainOverwriteButton: {fileID: 0}
+  clearButton: {fileID: 0}
+  clearAlsoDeleteClassesToggle: {fileID: 0}
+  injectionJsonInput: {fileID: 0}
+  injectJsonButton: {fileID: 0}
+  exportJsonButton: {fileID: 0}
+  startAfterTrain: 1
+  headText: {fileID: 0}
+  statusText: {fileID: 0}
+  messageText: {fileID: 0}
 --- !u!1 &436509935
 GameObject:
   m_ObjectHideFlags: 0
@@ -34572,9 +34615,10 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   classifier: {fileID: 1768058390}
-  headsFolder: heads
-  prefsKeyFile: TinyTeach_LastHead
-  prefsKeyName: TinyTeach_LastHeadName
+  loadOnStart: 1
+  doNotOverrideUserChoice: 1
+  defaultHeadName: 
+  lastHeadPlayerPrefKey: TTM_LastHead
 --- !u!4 &1313489084
 Transform:
   m_ObjectHideFlags: 0
@@ -48117,7 +48161,10 @@ MonoBehaviour:
   defaultHeadJson: {fileID: 4900000, guid: f19c0622a0e525f43b35b7086d911be1, type: 3}
   classifyEvery: 2
   smooth: 5
-  currentHeadName: (none)
+  consoleDebug: 1
+  logPredictions: 1
+  EnforcePreferredHead: 0
+  PreferredHeadName: 
 --- !u!4 &1768058391
 Transform:
   m_ObjectHideFlags: 0
@@ -48146,19 +48193,15 @@ MonoBehaviour:
   m_Name: 
   m_EditorClassIdentifier: 
   classifier: {fileID: 1768058390}
-  embedder: {fileID: 485314770}
   detectionManager: {fileID: 1979709791}
+  embedder: {fileID: 485314770}
   labelText: {fileID: 1292327120}
   scoreText: {fileID: 1701460489}
-  modelText: {fileID: 0}
   headText: {fileID: 1768958398}
   fpsText: {fileID: 0}
   detectionDropdown: {fileID: 1535803190}
   refreshDetectionsButton: {fileID: 410073106}
-  playButton: {fileID: 750516259}
-  stopButton: {fileID: 701325134}
-  runStateText: {fileID: 1964877715}
-  applyOnDropdownChange: 1
+  lastHeadPlayerPrefKey: TTM_LastHead
   scoreFormat: 0.00
 --- !u!1 &1768958396
 GameObject:
@@ -54783,9 +54826,13 @@ MonoBehaviour:
   sessionName: session1
   saveHeadName: head_runtime.json
   loadHeadName: head_runtime.json
-  classNames:
-  - class_A
-  - class_B
+  numClasses: 2
+  currentClass: 0
+  Classes:
+  - A
+  - B
+  l2NormalizeEmbeddings: 1
+  snapshotSize: 256
 --- !u!224 &1971614292
 RectTransform:
   m_ObjectHideFlags: 0
